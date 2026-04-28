@@ -821,7 +821,7 @@ def run_dashboard():
             auto_list = f.read()
     else:
         auto_list = "\n".join(WATCHLIST)
-
+        
     custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=300)
     run_btn = st.button("▶ RUN SCAN NOW", use_container_width=True)
     st.markdown("---")
