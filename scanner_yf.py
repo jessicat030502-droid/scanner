@@ -159,11 +159,11 @@ SECTOR_MAP = {
     "NTST": "XLRE", "GMRE": "XLRE", "EPRT": "XLRE",
 }
 
-# ── MID-CAP FILTER ───────────────────────────────────────────
-# Any symbol outside this range is skipped at scan time.
-# yfinance .info["marketCap"] used for live check.
-MIDCAP_MIN = 1_000_000_000    # $1B
-MIDCAP_MAX = 20_000_000_000   # $20B
+# ── SMALL + MID CAP FILTER ───────────────────────────────────
+# Hard block: anything outside this range is SKIPPED entirely.
+# Small cap: $300M–$2B  |  Mid cap: $2B–$20B
+MIDCAP_MIN = 300_000_000     # $300M floor (small cap bottom)
+MIDCAP_MAX = 20_000_000_000  # $20B ceiling (mid cap top)
 
 # Polling interval for live mode (seconds)
 # yfinance 1-min data has a 15-sec lag — don't poll faster than this
@@ -219,11 +219,12 @@ def get_market_cap(symbol: str) -> Optional[float]:
 def is_midcap(symbol: str) -> tuple:
     """
     Returns (passes_filter: bool, market_cap_billions: float).
-    Lets symbol through if market cap data is unavailable.
+    BLOCKS symbol if outside $300M–$20B or if data unavailable.
+    This prevents AMZN/AAPL/MSFT slipping through on bad data.
     """
     mcap = get_market_cap(symbol)
     if mcap is None:
-        return True, 0.0
+        return False, 0.0   # can't verify → block, don't risk large cap
     passes = MIDCAP_MIN <= mcap <= MIDCAP_MAX
     return passes, round(mcap / 1_000_000_000, 2)
 
@@ -669,18 +670,33 @@ def scan_symbol(symbol: str, market: dict) -> Optional[dict]:
 def run_full_scan(symbols: list = WATCHLIST) -> tuple[pd.DataFrame, dict]:
     """
     Runs full scan on all symbols.
+    Skips anything outside $300M–$20B market cap.
     Returns (results_df, market_info).
+    market_info includes 'blocked' count of filtered-out large/mega caps.
     """
-    market = get_market_regime()
+    market  = get_market_regime()
     results = []
+    blocked = []
 
     for sym in symbols:
         try:
+            # Pre-check cap before full scan to show user what got blocked
+            passes, mcap_b = is_midcap(sym)
+            if not passes:
+                blocked.append(f"{sym} (${mcap_b:.1f}B)" if mcap_b > 0 else sym)
+                continue
             r = scan_symbol(sym, market)
             if r:
                 results.append(r)
         except Exception as e:
             print(f"[SCAN ERR] {sym}: {e}")
+
+    if blocked:
+        print(f"[FILTER] Blocked {len(blocked)} large/mega-cap(s): {', '.join(blocked)}")
+
+    market["blocked"]      = blocked
+    market["blocked_count"]= len(blocked)
+    market["scanned"]      = len(results)
 
     if not results:
         return pd.DataFrame(), market
@@ -778,10 +794,13 @@ def run_dashboard():
         refresh     = st.slider("Refresh (sec)", 30, 300, POLL_INTERVAL)
         custom_syms = st.text_area("Watchlist (one per line)",
                                     value="\n".join(WATCHLIST), height=300)
-        run_btn     = st.button("▶ RUN SCAN NOW", use_container_width=True)
+        run_btn     = st.button("▶ RUN SCAN NOW", use_container_width=True)  # noqa
         st.markdown("---")
         st.markdown("""
         <div style='font-family:Share Tech Mono;font-size:11px;color:#2a4a62'>
+        <b style='color:#ffb400'>CAP FILTER: $300M – $20B</b><br>
+        Large caps (AMZN, AAPL etc) auto-blocked.<br>
+        Stocks outside range are silently skipped.<br><br>
         Data: yfinance (daily + 1-min)<br>
         Hawkes: 1-min volume events<br>
         OFI: Bulk Volume Classification<br>
@@ -832,6 +851,8 @@ def run_dashboard():
     if market:
         regime_color = "#00ff8c" if "RISK-ON" in market.get("regime","") else (
                        "#ff4040" if "RISK-OFF" in market.get("regime","") else "#ffb400")
+        blocked_str  = (f" &nbsp;|&nbsp; 🚫 {market['blocked_count']} large-cap blocked"
+                        if market.get("blocked_count", 0) > 0 else "")
         st.markdown(
             f'<div class="market">MARKET: '
             f'<span style="color:{regime_color}">{market.get("regime","—")}</span>'
@@ -839,6 +860,8 @@ def run_dashboard():
             f'({market.get("spy_dev",0):+.2f}%) '
             f'&nbsp;|&nbsp; QQQ {market.get("qqq_price","—")} '
             f'({market.get("qqq_dev",0):+.2f}%)'
+            f' &nbsp;|&nbsp; ✅ {market.get("scanned",0)} scanned'
+            f'{blocked_str}'
             f'</div>',
             unsafe_allow_html=True
         )
@@ -936,7 +959,7 @@ def run_dashboard():
             "kelly_frac": "Kelly%", "shares": "Shares",
             "stop": "Stop $", "target": "Target $", "market": "Mkt"
         }),
-        use_container_width=True,
+        use_container_width=True,  # noqa — use width='stretch' in future
         hide_index=True,
     )
 
