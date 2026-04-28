@@ -1,9 +1,35 @@
 """
 ============================================================
-  QUANT SCANNER — FULL YFINANCE BUILD
+
+  QUANT SCANNER — FULL YFINANCE BUILD  (v2 — PATCHED)
   scanner_yf.py
 
-  No Schwab. No API keys. No setup beyond pip install.
+  FIXES vs v1:
+  ─────────────────────────────────────────────────────────
+  FIX 1 — Intraday Momentum Gate
+      Penalises composite score when price is dropping
+      from today's open (>1% down → 0.75×, >2% → 0.50×,
+      >3% → 0.25×). Kills alert entirely below -3%.
+
+  FIX 2 — VWAP Gate
+      Computes VWAP from today's 1-min bars. If price is
+      below VWAP the composite is penalised and alert is
+      suppressed — avoids entering into active sell-offs.
+
+  FIX 3 — Directional Hawkes (buy vs sell volume)
+      Splits each 1-min bar into buy_vol / sell_vol using
+      Bulk Volume Classification before feeding into
+      Hawkes. Spikes in *sell* volume now REDUCE intensity
+      instead of inflating it — fixing the false "clustering"
+      signal on gap-down / sell-off days.
+
+  FIX 4 — Lower-Low Momentum Filter
+      Checks the last 10 1-min candles. If price is making
+      consecutive lower lows the signal is suppressed.
+
+  FIX 5 — Gap-Down Detection
+      Compares today's open to prior close. A gap down
+      > 1% adds an additional penalty multiplier.
 
   DATA SOURCE STRATEGY
   ─────────────────────
@@ -12,31 +38,18 @@
   yfinance daily bars  → Market Regime (SPY/QQQ)
   yfinance daily bars  → Sector Relative Strength
 
-  TRADEOFF vs LIVE TICK FEED
-  ──────────────────────────
-  Live tick:   true bid/ask on every trade  → ~85% OFI accuracy
-  1-min bars:  OHLCV per minute candle      → ~72% OFI accuracy
-  The gap is real but manageable. The Hawkes/OFI signals
-  you get here are still significantly better than RSI/MACD.
-
   INSTALL
   ───────
   pip install yfinance pandas numpy streamlit
 
   RUN MODES
   ─────────
-  Mode 1 — Terminal scanner (prints ranked table):
+  Mode 1 — Terminal scanner:
     python scanner_yf.py
 
-  Mode 2 — Streamlit dashboard (live auto-refresh):
+  Mode 2 — Streamlit dashboard:
     streamlit run scanner_yf.py
 
-  GITHUB DEPLOYMENT
-  ─────────────────
-  1. Push scanner_yf.py to a public GitHub repo
-  2. Go to share.streamlit.io → connect repo → deploy
-  3. Set ACCOUNT_SIZE in Streamlit Secrets if desired
-  Free hosting, runs in browser, no local Python needed.
 ============================================================
 """
 
@@ -69,137 +82,76 @@ except ImportError:
 #  CONFIG  ← edit these
 # ============================================================
 
-# ── MID-CAP PRESET WATCHLIST ($1B–$20B) ─────────────────────
-# 40 liquid mid-caps across 8 sectors. The scanner auto-filters
-# any that drift outside the $1B–$20B market cap range at runtime.
-#
-# To add your own: just append the ticker to WATCHLIST and add
-# its sector ETF to SECTOR_MAP.
-
 WATCHLIST = [
     # ── Technology (XLK) ──────────────────────────────────
-    "CRUS",   # Cirrus Logic          — analog semis
-    "POWI",   # Power Integrations    — power mgmt chips
-    "MTSI",   # MACOM Technology      — RF/microwave semis
-    "JAMF",   # Jamf Holding          — Apple device mgmt SaaS
-    "ALKT",   # Alkami Technology     — digital banking SaaS
-    "TASK",   # TaskUs                — tech-enabled BPO
-
+    "CRUS", "POWI", "MTSI", "JAMF", "ALKT", "TASK",
     # ── Consumer Discretionary (XLY) ──────────────────────
-    "BOOT",   # Boot Barn Holdings    — western/work apparel
-    "GIII",   # G-III Apparel         — fashion/licensing
-    "PLAY",   # Dave & Buster's       — entertainment venues
-    "LESL",   # Leslie's              — pool supplies retail
-    "PRPL",   # Purple Innovation     — sleep products
-    "HIMS",   # Hims & Hers Health    — telehealth/DTC
-
+    "BOOT", "GIII", "PLAY", "LESL", "PRPL", "HIMS",
     # ── Healthcare (XLV) ──────────────────────────────────
-    "ACAD",   # Acadia Pharmaceuticals — CNS drugs
-    "INVA",   # Innoviva               — royalty pharma
-    "PDCO",   # Patterson Companies    — dental/vet supply
-    "HCAT",   # Health Catalyst        — healthcare data
-    "NVCR",   # NovoCure                — oncology devices
-    "GKOS",   # Glaukos Corporation    — eye care devices
-
+    "ACAD", "INVA", "PDCO", "HCAT", "NVCR", "GKOS",
     # ── Financials (XLF) ──────────────────────────────────
-    "CURO",   # CURO Group             — consumer finance
-    "OPFI",   # OppFi                  — fintech lending
-    "HIBB",   # Hibbett                — specialty retail/fin
-    "GCMG",   # GCM Grosvenor          — alt asset mgmt
-    "NRDS",   # NerdWallet              — personal finance
-
+    "CURO", "OPFI", "HIBB", "GCMG", "NRDS",
     # ── Energy (XLE) ──────────────────────────────────────
-    "CIVI",   # Civitas Resources      — oil & gas E&P
-    "BATL",   # Battalion Oil          — E&P
-    "REX",    # REX Energy             — nat gas
-    "PTEN",   # Patterson-UTI Energy   — drilling services
-    "WTTR",   # Select Water Solutions — water services
-
+    "CIVI", "BATL", "REX", "PTEN", "WTTR",
     # ── Industrials (XLI) ─────────────────────────────────
-    "KTOS",   # Kratos Defense         — unmanned systems
-    "ASTE",   # Astec Industries       — infrastructure equip
-    "HLIO",   # Helios Technologies    — hydraulics
-    "DLX",    # Deluxe Corporation     — business services
-    "HAYW",   # Hayward Holdings       — pool equipment
-
+    "KTOS", "ASTE", "HLIO", "DLX", "HAYW",
     # ── Materials (XLB) ───────────────────────────────────
-    "TROX",   # Tronox Holdings        — titanium dioxide
-    "RYAM",   # Rayonier Advanced      — specialty cellulose
-    "KWR",    # Quaker Houghton        — industrial fluids
-
+    "TROX", "RYAM", "KWR",
     # ── Real Estate (XLRE) ────────────────────────────────
-    "NTST",   # NETSTREIT               — net lease REIT
-    "GMRE",   # Global Medical REIT     — healthcare facilities
-    "EPRT",   # Essential Properties    — net lease REIT
+    "NTST", "GMRE", "EPRT",
 ]
 
-# Sector ETF map — used for relative strength gate
 SECTOR_MAP = {
-    # Tech
     "CRUS": "XLK", "POWI": "XLK", "MTSI": "XLK",
     "JAMF": "XLK", "ALKT": "XLK", "TASK": "XLK",
-    # Consumer Disc
     "BOOT": "XLY", "GIII": "XLY", "PLAY": "XLY",
     "LESL": "XLY", "PRPL": "XLY", "HIMS": "XLY",
-    # Healthcare
     "ACAD": "XLV", "INVA": "XLV", "PDCO": "XLV",
     "HCAT": "XLV", "NVCR": "XLV", "GKOS": "XLV",
-    # Financials
     "CURO": "XLF", "OPFI": "XLF", "HIBB": "XLF",
     "GCMG": "XLF", "NRDS": "XLF",
-    # Energy
-    "CIVI": "XLE", "BATL": "XLE", "REX": "XLE",
+    "CIVI": "XLE", "BATL": "XLE", "REX":  "XLE",
     "PTEN": "XLE", "WTTR": "XLE",
-    # Industrials
     "KTOS": "XLI", "ASTE": "XLI", "HLIO": "XLI",
     "DLX":  "XLI", "HAYW": "XLI",
-    # Materials
-    "TROX": "XLB", "RYAM": "XLB", "KWR": "XLB",
-    # Real Estate
-    "NTST": "XLRE", "GMRE": "XLRE", "EPRT": "XLRE",
+    "TROX": "XLB", "RYAM": "XLB", "KWR":  "XLB",
+    "NTST": "XLRE","GMRE": "XLRE","EPRT": "XLRE",
 }
 
-# ── SMALL + MID CAP FILTER ───────────────────────────────────
-# Hard block: anything outside this range is SKIPPED entirely.
-# Small cap: $300M–$2B  |  Mid cap: $2B–$20B
-MIDCAP_MIN = 300_000_000     # $300M floor (small cap bottom)
-MIDCAP_MAX = 20_000_000_000  # $20B ceiling (mid cap top)
-
-# Polling interval for live mode (seconds)
-# yfinance 1-min data has a 15-sec lag — don't poll faster than this
-POLL_INTERVAL    = 60        # refresh every 60 seconds
-
+MIDCAP_MIN       = 300_000_000
+MIDCAP_MAX       = 20_000_000_000
+POLL_INTERVAL    = 60
 ACCOUNT_SIZE     = float(os.environ.get("ACCOUNT_SIZE", 50000))
 SIGNAL_THRESHOLD = 65
-SIGNAL_TTL       = 600       # 10-min signal decay
+SIGNAL_TTL       = 600
 
-# Composite weights
 W_HURST   = 0.20
 W_HAWKES  = 0.35
 W_OFI     = 0.30
 W_SECTOR  = 0.15
 
-# Thresholds
 SPY_WEAK_THRESH  = -0.005
 SECTOR_RS_MIN    = 1.02
 HAWKES_DECAY     = 0.3
-OFI_WINDOW       = 20        # bars (using 1-min, 20 bars = 20 min)
+OFI_WINDOW       = 20
+
+# ── FIX 1/5 thresholds ──────────────────────────────────────
+INTRADAY_SOFT_WARN  = -0.010   # -1.0%  → 0.75× multiplier
+INTRADAY_HARD_WARN  = -0.020   # -2.0%  → 0.50× multiplier
+INTRADAY_KILL       = -0.030   # -3.0%  → alert killed entirely
+GAP_DOWN_THRESH     = -0.010   # -1.0%  gap from prior close → extra penalty
+LOWER_LOW_BARS      = 10       # consecutive lower-low window (1-min bars)
 
 
 # ============================================================
-#  DATA LAYER — all yfinance
+#  DATA LAYER
 # ============================================================
 
-# ── Market cap cache (avoid re-fetching every scan) ─────────
-_mcap_cache: dict = {}   # sym → (mcap_float, timestamp)
-MCAP_CACHE_TTL = 3600    # re-check market cap every 60 min
+_mcap_cache: dict = {}
+MCAP_CACHE_TTL = 3600
 
 
 def get_market_cap(symbol: str) -> Optional[float]:
-    """
-    Returns current market cap in dollars via yfinance .info.
-    Cached for 60 min — .info is a slow HTTP call.
-    """
     now = time.time()
     if symbol in _mcap_cache:
         mcap, ts = _mcap_cache[symbol]
@@ -217,20 +169,14 @@ def get_market_cap(symbol: str) -> Optional[float]:
 
 
 def is_midcap(symbol: str) -> tuple:
-    """
-    Returns (passes_filter: bool, market_cap_billions: float).
-    BLOCKS symbol if outside $300M–$20B or if data unavailable.
-    This prevents AMZN/AAPL/MSFT slipping through on bad data.
-    """
     mcap = get_market_cap(symbol)
     if mcap is None:
-        return False, 0.0   # can't verify → block, don't risk large cap
+        return False, 0.0
     passes = MIDCAP_MIN <= mcap <= MIDCAP_MAX
     return passes, round(mcap / 1_000_000_000, 2)
 
 
 def fetch_daily(symbol: str, n: int = 60) -> Optional[pd.DataFrame]:
-    """Daily OHLCV. Used for Hurst, sector RS, market regime."""
     try:
         df = yf.Ticker(symbol).history(period="3mo", interval="1d")
         if df.empty or len(df) < 10:
@@ -243,11 +189,6 @@ def fetch_daily(symbol: str, n: int = 60) -> Optional[pd.DataFrame]:
 
 def fetch_intraday(symbol: str, period: str = "5d",
                    interval: str = "1m") -> Optional[pd.DataFrame]:
-    """
-    1-minute bars for the past 5 days.
-    Used to simulate tick-level Hawkes and OFI.
-    yfinance 1-min data is available for last 7 days.
-    """
     try:
         df = yf.Ticker(symbol).history(period=period, interval=interval)
         if df.empty or len(df) < 20:
@@ -264,14 +205,108 @@ def fetch_closes(symbol: str, n: int = 25) -> Optional[np.ndarray]:
 
 
 # ============================================================
-#  GAP 1: MARKET REGIME GATE
+#  FIX 1 + 4 + 5: INTRADAY HEALTH CHECK
+#  Returns a penalty multiplier and descriptive flags.
+# ============================================================
+
+def intraday_health(df_1min: pd.DataFrame,
+                    prior_close: float) -> tuple[float, str, dict]:
+    """
+    FIX 1 — Intraday momentum penalty
+    FIX 4 — Lower-low detection
+    FIX 5 — Gap-down detection
+
+    Returns:
+        mult       : float  0.0–1.0 penalty multiplier on composite
+        label      : str    human-readable flag
+        detail     : dict   individual flags for display
+    """
+    if df_1min is None or len(df_1min) < 5:
+        return 1.0, "NO DATA", {}
+
+    # Today's bars only (index is tz-aware datetime)
+    try:
+        today_str = pd.Timestamp.now(tz=df_1min.index.tz).strftime("%Y-%m-%d")
+        today_mask = df_1min.index.strftime("%Y-%m-%d") == today_str
+        today_bars = df_1min[today_mask]
+    except Exception:
+        today_bars = df_1min.tail(60)   # fallback: last 60 bars
+
+    if len(today_bars) < 3:
+        today_bars = df_1min.tail(60)
+
+    today_open  = float(today_bars["open"].iloc[0])
+    current     = float(today_bars["close"].iloc[-1])
+    intraday_r  = (current - today_open) / today_open if today_open > 0 else 0.0
+
+    # FIX 5 — Gap-down vs prior close
+    gap_r = (today_open - prior_close) / prior_close if prior_close > 0 else 0.0
+
+    # FIX 4 — Lower-low check on last N 1-min closes
+    recent = today_bars["close"].values[-LOWER_LOW_BARS:]
+    lower_lows = int(sum(recent[i] < recent[i - 1] for i in range(1, len(recent))))
+    making_lower_lows = lower_lows >= (LOWER_LOW_BARS - 2)   # 8+ of 10 bars
+
+    # ── FIX 2: VWAP ─────────────────────────────────────────
+    tp   = (today_bars["high"] + today_bars["low"] + today_bars["close"]) / 3
+    vwap = float((tp * today_bars["volume"]).cumsum().iloc[-1] /
+                 today_bars["volume"].cumsum().iloc[-1]) \
+           if today_bars["volume"].sum() > 0 else current
+    below_vwap = current < vwap
+
+    # ── Build multiplier ────────────────────────────────────
+    mult = 1.0
+    flags = []
+
+    # Gap-down penalty
+    if gap_r < GAP_DOWN_THRESH:
+        mult  *= 0.85
+        flags.append(f"GAP↓{gap_r*100:.1f}%")
+
+    # Intraday drop penalty
+    if intraday_r <= INTRADAY_KILL:
+        mult   = 0.0
+        flags.append(f"SELLOFF {intraday_r*100:.1f}%")
+    elif intraday_r <= INTRADAY_HARD_WARN:
+        mult  *= 0.50
+        flags.append(f"WEAK {intraday_r*100:.1f}%")
+    elif intraday_r <= INTRADAY_SOFT_WARN:
+        mult  *= 0.75
+        flags.append(f"SOFT {intraday_r*100:.1f}%")
+    else:
+        flags.append(f"OK {intraday_r*100:+.1f}%")
+
+    # Lower-low penalty
+    if making_lower_lows:
+        mult  *= 0.70
+        flags.append("LOWER-LOWS")
+
+    # VWAP penalty
+    if below_vwap:
+        mult  *= 0.80
+        flags.append(f"<VWAP${vwap:.2f}")
+
+    mult  = float(np.clip(mult, 0.0, 1.0))
+    label = " | ".join(flags) if flags else "HEALTHY"
+
+    detail = {
+        "intraday_ret":     round(intraday_r * 100, 2),
+        "gap_ret":          round(gap_r * 100, 2),
+        "today_open":       round(today_open, 2),
+        "vwap":             round(vwap, 2),
+        "below_vwap":       below_vwap,
+        "lower_lows":       lower_lows,
+        "making_lower_lows":making_lower_lows,
+        "health_mult":      round(mult, 3),
+    }
+    return mult, label, detail
+
+
+# ============================================================
+#  MARKET REGIME GATE
 # ============================================================
 
 def get_market_regime() -> dict:
-    """
-    Returns market regime based on SPY + QQQ vs their 20-day SMA.
-    RISK-ON / RISK-OFF / NEUTRAL
-    """
     spy = fetch_closes("SPY", 25)
     qqq = fetch_closes("QQQ", 25)
 
@@ -285,41 +320,28 @@ def get_market_regime() -> dict:
     qp, qd = deviation(qqq)
 
     if sd > 0.002 and qd > 0.002:
-        regime      = "RISK-ON 📈"
-        allows_long = True
-        mkt_mult    = 1.10
+        regime = "RISK-ON 📈"; allows_long = True;  mkt_mult = 1.10
     elif sd < SPY_WEAK_THRESH and qd < SPY_WEAK_THRESH:
-        regime      = "RISK-OFF 📉"
-        allows_long = False
-        mkt_mult    = 0.40
+        regime = "RISK-OFF 📉"; allows_long = False; mkt_mult = 0.40
     else:
-        regime      = "NEUTRAL ➡"
-        allows_long = True
-        mkt_mult    = 1.00
+        regime = "NEUTRAL ➡";  allows_long = True;  mkt_mult = 1.00
 
     return {
-        "regime":      regime,
-        "allows_long": allows_long,
-        "mkt_mult":    mkt_mult,
-        "spy_price":   round(sp, 2),
-        "spy_dev":     round(sd * 100, 2),
-        "qqq_price":   round(qp, 2),
-        "qqq_dev":     round(qd * 100, 2),
+        "regime": regime, "allows_long": allows_long, "mkt_mult": mkt_mult,
+        "spy_price": round(sp, 2), "spy_dev": round(sd * 100, 2),
+        "qqq_price": round(qp, 2), "qqq_dev": round(qd * 100, 2),
     }
 
 
 # ============================================================
-#  GAP 2: SECTOR RELATIVE STRENGTH
+#  SECTOR RELATIVE STRENGTH
 # ============================================================
 
 def get_sector_rs(etf: str) -> tuple[float, float, bool]:
-    """Returns (rs_ratio, score_0_100, gate_open)."""
     etf_c = fetch_closes(etf, 25)
     spy_c = fetch_closes("SPY", 25)
-
     if etf_c is None or spy_c is None or len(etf_c) < 20 or len(spy_c) < 20:
         return 1.0, 50.0, True
-
     etf_rs = etf_c[-1] / np.mean(etf_c[-20:])
     spy_rs = spy_c[-1] / np.mean(spy_c[-20:])
     ratio  = etf_rs / spy_rs if spy_rs > 0 else 1.0
@@ -329,7 +351,7 @@ def get_sector_rs(etf: str) -> tuple[float, float, bool]:
 
 
 # ============================================================
-#  LAYER 1: HURST EXPONENT (daily close prices)
+#  LAYER 1: HURST EXPONENT
 # ============================================================
 
 def compute_hurst(prices: np.ndarray) -> float:
@@ -372,25 +394,40 @@ def hurst_regime(H: float) -> str:
 
 
 # ============================================================
-#  LAYER 2: HAWKES INTENSITY (1-min bar volume)
+#  LAYER 2: DIRECTIONAL HAWKES  ← FIX 3
 #
-#  Without tick data we use 1-min candle volume as events.
-#  Each bar where volume > 1.8× its 20-bar avg = "spike event."
-#  λ decays between bars using bar index as time proxy.
+#  v1 bug: any volume spike (buy OR sell) inflated λ.
+#  v2 fix: split each bar into buy_vol / sell_vol via BVC.
+#          Buy spikes  → +alpha  (as before)
+#          Sell spikes → -alpha  (NEW — reduces intensity)
+#  This prevents a gap-down sell-off from generating a
+#  false "CLUSTERING" signal.
 # ============================================================
 
 def compute_hawkes(df_1min: pd.DataFrame) -> tuple[float, float]:
     """
     Returns (current_lambda, hawkes_score_0_100).
-    Uses 1-min volume bars as the event stream.
+    Directional: sell spikes now reduce intensity.
     """
-    vols    = df_1min["volume"].values
-    n       = len(vols)
+    close = df_1min["close"].values
+    high  = df_1min["high"].values
+    low   = df_1min["low"].values
+    vols  = df_1min["volume"].values
+    n     = len(vols)
+
     if n < 20:
         return 0.0, 50.0
 
-    baseline = pd.Series(vols).rolling(20, min_periods=5).mean().values
-    mu       = np.nanmean(baseline[~np.isnan(baseline)])
+    # BVC split — same as OFI
+    bar_range = high - low
+    buy_ratio = np.where(bar_range > 0, (close - low) / bar_range, 0.5)
+    buy_vol   = buy_ratio * vols
+    sell_vol  = (1 - buy_ratio) * vols
+
+    baseline_buy  = pd.Series(buy_vol).rolling(20, min_periods=5).mean().values
+    baseline_sell = pd.Series(sell_vol).rolling(20, min_periods=5).mean().values
+
+    mu   = np.nanmean(baseline_buy[~np.isnan(baseline_buy)])
     if mu <= 0:
         return 0.0, 50.0
 
@@ -401,11 +438,21 @@ def compute_hawkes(df_1min: pd.DataFrame) -> tuple[float, float]:
     intensities[0] = mu
 
     for t in range(1, n):
-        # Each bar = 1 time unit
         decayed  = mu + (intensities[t - 1] - mu) * math.exp(-beta)
-        base_t   = baseline[t - 1] if not np.isnan(baseline[t - 1]) else mu
-        is_spike = vols[t - 1] > base_t * 1.8
-        intensities[t] = decayed + (alpha if is_spike else 0.0)
+        bb_t     = baseline_buy[t - 1]  if not np.isnan(baseline_buy[t - 1])  else mu
+        bs_t     = baseline_sell[t - 1] if not np.isnan(baseline_sell[t - 1]) else mu
+
+        is_buy_spike  = buy_vol[t - 1]  > bb_t * 1.8
+        is_sell_spike = sell_vol[t - 1] > bs_t * 1.8
+
+        # FIX 3: buy spikes add, sell spikes subtract
+        delta = 0.0
+        if is_buy_spike:
+            delta += alpha
+        if is_sell_spike:
+            delta -= alpha * 0.8   # sell pressure dampens intensity
+
+        intensities[t] = max(0.0, decayed + delta)
 
     cur_lambda   = intensities[-1]
     baseline_lam = np.nanmean(intensities[max(0, n - 30):-5]) if n > 10 else mu
@@ -427,16 +474,9 @@ def hawkes_signal(score: float) -> str:
 
 # ============================================================
 #  LAYER 3: OFI PROXY (1-min bars)
-#
-#  Each 1-min candle gets buy/sell volume split by close position
-#  within the bar's range. Rolling OFI = buy% over last N bars.
-#  This is the Bulk Volume Classification method.
 # ============================================================
 
 def compute_ofi(df_1min: pd.DataFrame, window: int = OFI_WINDOW) -> tuple[float, float, float]:
-    """
-    Returns (current_ofi, ofi_delta, ofi_score).
-    """
     close = df_1min["close"].values
     high  = df_1min["high"].values
     low   = df_1min["low"].values
@@ -444,31 +484,30 @@ def compute_ofi(df_1min: pd.DataFrame, window: int = OFI_WINDOW) -> tuple[float,
 
     bar_range = high - low
     buy_ratio = np.where(bar_range > 0, (close - low) / bar_range, 0.5)
-
-    buy_vol = buy_ratio * vol
-    tot_vol = vol
+    buy_vol   = buy_ratio * vol
+    tot_vol   = vol
 
     buy_roll = pd.Series(buy_vol).rolling(window, min_periods=3).sum()
     tot_roll = pd.Series(tot_vol).rolling(window, min_periods=3).sum()
     ofi_s    = (buy_roll / tot_roll.replace(0, np.nan)).fillna(0.5)
 
-    cur_ofi  = float(ofi_s.iloc[-1])
-    delta    = float(ofi_s.iloc[-1] - ofi_s.iloc[-4]) if len(ofi_s) >= 4 else 0.0
-    score    = float(np.clip(cur_ofi * 100 + delta * 50, 0, 100))
+    cur_ofi = float(ofi_s.iloc[-1])
+    delta   = float(ofi_s.iloc[-1] - ofi_s.iloc[-4]) if len(ofi_s) >= 4 else 0.0
+    score   = float(np.clip(cur_ofi * 100 + delta * 50, 0, 100))
 
     return round(cur_ofi, 4), round(delta, 4), round(score, 1)
 
 
 def ofi_signal(ofi: float, delta: float) -> str:
-    if ofi >= 0.65 and delta >= 0:   return "🟢 ACCUMULATING"
-    elif ofi >= 0.60 and delta < 0:  return "🟡 TOPPING"
-    elif ofi <= 0.35:                return "🔴 DISTRIBUTING"
-    elif ofi <= 0.42:                return "🟠 SELLING"
-    else:                            return "⚪ NEUTRAL"
+    if ofi >= 0.65 and delta >= 0:  return "🟢 ACCUMULATING"
+    elif ofi >= 0.60 and delta < 0: return "🟡 TOPPING"
+    elif ofi <= 0.35:               return "🔴 DISTRIBUTING"
+    elif ofi <= 0.42:               return "🟠 SELLING"
+    else:                           return "⚪ NEUTRAL"
 
 
 # ============================================================
-#  GAP 3: KELLY POSITION SIZER
+#  KELLY POSITION SIZER
 # ============================================================
 
 def compute_atr_daily(df_daily: pd.DataFrame, n: int = 14) -> float:
@@ -489,7 +528,6 @@ def compute_atr_daily(df_daily: pd.DataFrame, n: int = 14) -> float:
 def kelly_size(price: float, atr: float,
                win_rate: float = 0.60,
                rr: float = 2.0) -> tuple[float, float, int]:
-    """Returns (kelly_fraction, dollar_risk, shares)."""
     if atr <= 0 or price <= 0:
         return 0.0, 0.0, 0
     kf        = max(0.0, (win_rate - (1 - win_rate) / rr) * 0.5)
@@ -502,30 +540,22 @@ def kelly_size(price: float, atr: float,
 
 
 # ============================================================
-#  GAP 4: SIGNAL DECAY
+#  SIGNAL DECAY
 # ============================================================
 
-# Track when each symbol's signal fired
-_signal_fire_times: dict[str, float] = {}
+_signal_fire_times: dict[str, float]  = {}
 _signal_entry_prices: dict[str, float] = {}
 
 
 def check_signal_decay(symbol: str, score: float,
                         current_price: float,
                         atr: float) -> tuple[bool, float, bool]:
-    """
-    Returns (signal_live, seconds_remaining, just_expired).
-
-    Starts a 10-min timer when score first crosses threshold.
-    Marks confirmed if price moves > 0.5 ATR before expiry.
-    Kills the signal (returns False) if TTL exceeded without confirmation.
-    """
-    now = time.time()
+    now      = time.time()
     is_alert = score >= SIGNAL_THRESHOLD
 
     if is_alert and symbol not in _signal_fire_times:
-        _signal_fire_times[symbol]    = now
-        _signal_entry_prices[symbol]  = current_price
+        _signal_fire_times[symbol]   = now
+        _signal_entry_prices[symbol] = current_price
 
     if symbol not in _signal_fire_times:
         return False, 0.0, False
@@ -533,12 +563,9 @@ def check_signal_decay(symbol: str, score: float,
     elapsed   = now - _signal_fire_times[symbol]
     remaining = max(0.0, SIGNAL_TTL - elapsed)
     entry     = _signal_entry_prices.get(symbol, current_price)
-
-    # Price confirmation — moved > 0.5 ATR in right direction
     confirmed = (current_price - entry) > atr * 0.5
 
     if not is_alert:
-        # Score dropped — reset timer
         _signal_fire_times.pop(symbol, None)
         _signal_entry_prices.pop(symbol, None)
         return False, 0.0, False
@@ -546,141 +573,141 @@ def check_signal_decay(symbol: str, score: float,
     if elapsed > SIGNAL_TTL and not confirmed:
         _signal_fire_times.pop(symbol, None)
         _signal_entry_prices.pop(symbol, None)
-        return False, 0.0, True   # just_expired
+        return False, 0.0, True
 
     return True, round(remaining, 0), False
 
 
 # ============================================================
 #  MAIN SCAN FUNCTION
-#  Pulls all data for one symbol and returns a result dict.
 # ============================================================
 
 def scan_symbol(symbol: str, market: dict) -> Optional[dict]:
-    """
-    Full scan for one symbol.
-    Fetches daily + 1-min data, runs all 4 layers + gaps.
-    Returns result dict or None if data insufficient or outside mid-cap range.
-    """
-    # ── MID-CAP GATE ────────────────────────────────────────
+    # ── MID-CAP GATE ─────────────────────────────────────────
     passes_mcap, mcap_b = is_midcap(symbol)
     if not passes_mcap:
-        return None   # drifted outside $1B–$20B, skip silently
+        return None
 
-    # Daily data (Hurst, ATR, Kelly)
     df_daily = fetch_daily(symbol, 60)
     if df_daily is None or len(df_daily) < 30:
         return None
 
-    # 1-min intraday data (Hawkes, OFI)
     df_1min = fetch_intraday(symbol, period="5d", interval="1m")
     if df_1min is None or len(df_1min) < 30:
-        # Fallback: use daily as pseudo-intraday (lower accuracy)
         df_1min = df_daily.copy()
 
-    price = float(df_daily["close"].iloc[-1])
+    price       = float(df_daily["close"].iloc[-1])
+    prior_close = float(df_daily["close"].iloc[-2]) if len(df_daily) >= 2 else price
 
-    # ── LAYER 1: HURST ──────────────────────────────────────
-    H       = compute_hurst(df_daily["close"].values)
-    h_sc    = hurst_score(H)
-    h_reg   = hurst_regime(H)
+    # ── LAYER 1: HURST ───────────────────────────────────────
+    H      = compute_hurst(df_daily["close"].values)
+    h_sc   = hurst_score(H)
+    h_reg  = hurst_regime(H)
 
-    # ── LAYER 2: HAWKES ─────────────────────────────────────
+    # ── LAYER 2: DIRECTIONAL HAWKES (FIX 3) ─────────────────
     cur_lam, hawk_sc = compute_hawkes(df_1min)
     hawk_sig         = hawkes_signal(hawk_sc)
 
-    # ── LAYER 3: OFI ────────────────────────────────────────
+    # ── LAYER 3: OFI ─────────────────────────────────────────
     cur_ofi, ofi_d, o_sc = compute_ofi(df_1min)
     o_sig                 = ofi_signal(cur_ofi, ofi_d)
 
-    # ── GAP 2: SECTOR RS ────────────────────────────────────
-    etf                   = SECTOR_MAP.get(symbol, "SPY")
+    # ── SECTOR RS ────────────────────────────────────────────
+    etf                      = SECTOR_MAP.get(symbol, "SPY")
     sec_rs, sec_sc, sec_gate = get_sector_rs(etf)
 
-    # ── COMPOSITE ───────────────────────────────────────────
+    # ── COMPOSITE (pre-intraday adjustment) ──────────────────
     raw = float(np.clip(
-        W_HURST  * h_sc   +
+        W_HURST  * h_sc    +
         W_HAWKES * hawk_sc +
-        W_OFI    * o_sc   +
+        W_OFI    * o_sc    +
         W_SECTOR * sec_sc,
         0, 100
     ))
-
     sec_mult = 1.0 if sec_gate else 0.70
-    comp     = round(float(np.clip(raw * market["mkt_mult"] * sec_mult, 0, 100)), 1)
-    alert    = comp >= SIGNAL_THRESHOLD and market["allows_long"]
+    comp_raw = float(np.clip(raw * market["mkt_mult"] * sec_mult, 0, 100))
 
-    # ── GAP 3: KELLY ────────────────────────────────────────
-    atr                = compute_atr_daily(df_daily)
-    kf, drisk, shares  = kelly_size(price, atr) if alert else (0.0, 0.0, 0)
+    # ── FIX 1 + 2 + 4 + 5: INTRADAY HEALTH ──────────────────
+    health_mult, health_label, health_detail = intraday_health(df_1min, prior_close)
+    comp  = round(float(np.clip(comp_raw * health_mult, 0, 100)), 1)
+    alert = comp >= SIGNAL_THRESHOLD and market["allows_long"] and health_mult > 0.0
 
-    # ── GAP 4: SIGNAL DECAY ─────────────────────────────────
+    # ── KELLY ─────────────────────────────────────────────────
+    atr               = compute_atr_daily(df_daily)
+    kf, drisk, shares = kelly_size(price, atr) if alert else (0.0, 0.0, 0)
+
+    # ── SIGNAL DECAY ──────────────────────────────────────────
     sig_live, remaining, just_expired = check_signal_decay(symbol, comp, price, atr)
     if just_expired:
         alert = False
-        comp  = max(0.0, comp - 10)  # penalty on expiry
+        comp  = max(0.0, comp - 10)
 
-    # ── STOP LOSS ───────────────────────────────────────────
     stop_price = round(price - atr * 1.5, 2) if atr > 0 else 0.0
     target     = round(price + atr * 3.0, 2) if atr > 0 else 0.0
 
     return {
-        "symbol":       symbol,
-        "price":        round(price, 2),
-        "score":        comp,
-        "alert":        alert,
+        "symbol":        symbol,
+        "price":         round(price, 2),
+        "score":         comp,
+        "score_raw":     round(comp_raw, 1),   # pre-intraday score for debug
+        "alert":         alert,
 
-        # Layer outputs
-        "hurst_H":      round(H, 3),
-        "hurst_score":  round(h_sc, 1),
-        "hurst_regime": h_reg,
+        "hurst_H":       round(H, 3),
+        "hurst_score":   round(h_sc, 1),
+        "hurst_regime":  h_reg,
 
-        "hawkes_lam":   cur_lam,
-        "hawkes_score": hawk_sc,
-        "hawkes_sig":   hawk_sig,
+        "hawkes_lam":    cur_lam,
+        "hawkes_score":  hawk_sc,
+        "hawkes_sig":    hawk_sig,
 
-        "ofi":          cur_ofi,
-        "ofi_delta":    ofi_d,
-        "ofi_score":    o_sc,
-        "ofi_sig":      o_sig,
+        "ofi":           cur_ofi,
+        "ofi_delta":     ofi_d,
+        "ofi_score":     o_sc,
+        "ofi_sig":       o_sig,
 
-        # Gap outputs
-        "market":       market["regime"],
-        "sector_etf":   etf,
-        "sector_rs":    sec_rs,
-        "sector_score": sec_sc,
-        "sector_gate":  sec_gate,
+        "market":        market["regime"],
+        "sector_etf":    etf,
+        "sector_rs":     sec_rs,
+        "sector_score":  sec_sc,
+        "sector_gate":   sec_gate,
 
-        "kelly_frac":   kf,
-        "dollar_risk":  drisk,
-        "shares":       shares,
-        "atr":          atr,
-        "stop":         stop_price,
-        "target":       target,
+        "kelly_frac":    kf,
+        "dollar_risk":   drisk,
+        "shares":        shares,
+        "atr":           atr,
+        "stop":          stop_price,
+        "target":        target,
 
-        "sig_live":     sig_live,
-        "sig_remaining":int(remaining),
-        "just_expired": just_expired,
+        "sig_live":      sig_live,
+        "sig_remaining": int(remaining),
+        "just_expired":  just_expired,
 
-        "mcap_b":       mcap_b,   # market cap in billions
-        "scanned_at":   datetime.now().strftime("%H:%M:%S"),
+        "mcap_b":        mcap_b,
+
+        # ── NEW intraday fields ──────────────────────────────
+        "health_mult":   health_mult,
+        "health_label":  health_label,
+        "intraday_ret":  health_detail.get("intraday_ret", 0.0),
+        "gap_ret":       health_detail.get("gap_ret", 0.0),
+        "vwap":          health_detail.get("vwap", 0.0),
+        "below_vwap":    health_detail.get("below_vwap", False),
+        "lower_lows":    health_detail.get("lower_lows", 0),
+
+        "scanned_at":    datetime.now().strftime("%H:%M:%S"),
     }
 
 
+# ============================================================
+#  FULL SCAN
+# ============================================================
+
 def run_full_scan(symbols: list = WATCHLIST) -> tuple[pd.DataFrame, dict]:
-    """
-    Runs full scan on all symbols.
-    Skips anything outside $300M–$20B market cap.
-    Returns (results_df, market_info).
-    market_info includes 'blocked' count of filtered-out large/mega caps.
-    """
     market  = get_market_regime()
     results = []
     blocked = []
 
     for sym in symbols:
         try:
-            # Pre-check cap before full scan to show user what got blocked
             passes, mcap_b = is_midcap(sym)
             if not passes:
                 blocked.append(f"{sym} (${mcap_b:.1f}B)" if mcap_b > 0 else sym)
@@ -694,9 +721,9 @@ def run_full_scan(symbols: list = WATCHLIST) -> tuple[pd.DataFrame, dict]:
     if blocked:
         print(f"[FILTER] Blocked {len(blocked)} large/mega-cap(s): {', '.join(blocked)}")
 
-    market["blocked"]      = blocked
-    market["blocked_count"]= len(blocked)
-    market["scanned"]      = len(results)
+    market["blocked"]       = blocked
+    market["blocked_count"] = len(blocked)
+    market["scanned"]       = len(results)
 
     if not results:
         return pd.DataFrame(), market
@@ -707,35 +734,35 @@ def run_full_scan(symbols: list = WATCHLIST) -> tuple[pd.DataFrame, dict]:
 
 # ============================================================
 #  TERMINAL MODE
-#  Runs when called directly: python scanner_yf.py
 # ============================================================
 
 def print_results(df: pd.DataFrame, market: dict):
-    print(f"\n{'='*72}")
-    print(f"  QUANT SCANNER  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n{'='*80}")
+    print(f"  QUANT SCANNER v2  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  MARKET: {market['regime']}  SPY={market['spy_price']} ({market['spy_dev']:+.2f}%)")
-    print(f"{'='*72}")
-    print(f"  {'SYM':<6} {'SCORE':>5}  {'REGIME':<14} {'HAWKES':<14} {'OFI':<16} {'KELLY%':>6}  {'SHR':>5}  {'DECAY':>6}")
-    print(f"  {'─'*70}")
+    print(f"{'='*80}")
+    print(f"  {'SYM':<6} {'SCORE':>5} {'RAW':>5}  {'HEALTH':<26} {'HAWKES':<14} {'OFI':<16} {'KELLY%':>6}  {'SHR':>5}")
+    print(f"  {'─'*78}")
 
     for _, r in df.iterrows():
         flag = " ◄◄" if r["alert"] else ("  ✗" if r["just_expired"] else "   ")
-        dec  = f"{r['sig_remaining']}s" if r["sig_live"] else "—"
         print(
-            f"  {r['symbol']:<6} {r['score']:>5}  "
-            f"{r['hurst_regime']:<14} {r['hawkes_sig']:<14} "
+            f"  {r['symbol']:<6} {r['score']:>5}  {r['score_raw']:>4}  "
+            f"{r['health_label']:<26} {r['hawkes_sig']:<14} "
             f"{r['ofi_sig']:<16} {r['kelly_frac']:>5.1%}  "
-            f"{r['shares']:>5}  {dec:>6}{flag}"
+            f"{r['shares']:>5}{flag}"
         )
 
     alerts = df[df["alert"] == True]
-    print(f"\n  {'─'*70}")
+    print(f"\n  {'─'*78}")
     print(f"  Signals: {len(alerts)}/{len(df)}  |  Market gate: {'✓ OPEN' if market['allows_long'] else '✗ RISK-OFF'}")
 
     if len(alerts) > 0:
-        print(f"\n  ── TOP PICKS {'─'*50}")
+        print(f"\n  ── TOP PICKS {'─'*58}")
         for _, r in alerts.iterrows():
             print(f"\n  {r['symbol']}  ${r['price']}  MCap ${r.get('mcap_b',0):.1f}B  [{r['score']}]")
+            print(f"    Intraday: {r['intraday_ret']:+.2f}% from open | Gap: {r['gap_ret']:+.2f}% | VWAP ${r['vwap']:.2f} {'✗ BELOW' if r['below_vwap'] else '✓ ABOVE'}")
+            print(f"    Health  : {r['health_label']} (mult {r['health_mult']:.2f}×)")
             print(f"    Hurst   : H={r['hurst_H']}  → {r['hurst_regime']}")
             print(f"    Hawkes  : λ={r['hawkes_lam']}  → {r['hawkes_sig']}")
             print(f"    OFI     : {r['ofi']}  Δ={r['ofi_delta']}  → {r['ofi_sig']}")
@@ -745,17 +772,16 @@ def print_results(df: pd.DataFrame, market: dict):
             if r["sig_live"]:
                 print(f"    Decay   : {r['sig_remaining']}s remaining")
 
-    print(f"\n{'='*72}\n")
+    print(f"\n{'='*80}\n")
 
 
 # ============================================================
 #  STREAMLIT DASHBOARD
-#  Runs when: streamlit run scanner_yf.py
 # ============================================================
 
 def run_dashboard():
     st.set_page_config(
-        page_title="QUANT SCANNER",
+        page_title="QUANT SCANNER v2",
         page_icon="⚡",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -772,6 +798,8 @@ def run_dashboard():
     .card   { background:#0d1820; border:1px solid #1a2e40; border-radius:6px;
               padding:14px 16px; margin-bottom:10px; }
     .card.on{ border-color:#00ff8c; box-shadow:0 0 16px rgba(0,255,140,0.15); }
+    .card.warn { border-color:#ffb400; box-shadow:0 0 10px rgba(255,180,0,0.12); }
+    .card.off { border-color:#ff4040; opacity:0.7; }
     .sym    { font-family:'Share Tech Mono',monospace; font-size:22px; color:#e8f4ff;
               letter-spacing:2px; }
     .sc     { font-family:'Share Tech Mono',monospace; font-size:30px; font-weight:700; }
@@ -780,6 +808,8 @@ def run_dashboard():
     .bar-bg { background:#0a1520; border-radius:3px; height:6px; margin:8px 0 6px; overflow:hidden; }
     .bar-fg { height:6px; border-radius:3px; }
     .meta   { font-family:'Share Tech Mono',monospace; font-size:11px; color:#3a5a72; }
+    .health { font-family:'Share Tech Mono',monospace; font-size:11px;
+              padding:3px 8px; border-radius:3px; display:inline-block; }
     .trade  { background:#0a1820; border:1px solid #1a3040; border-radius:4px;
               padding:8px 12px; margin-top:8px; }
     </style>
@@ -799,31 +829,30 @@ if os.path.exists("auto_watchlist.txt"):
 else:
     auto_list = "\n".join(WATCHLIST)
 custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=300)
-        run_btn     = st.button("▶ RUN SCAN NOW", use_container_width=True)  # noqa
+        run_btn     = st.button("▶ RUN SCAN NOW", use_container_width=True)
         st.markdown("---")
         st.markdown("""
         <div style='font-family:Share Tech Mono;font-size:11px;color:#2a4a62'>
+        <b style='color:#ffb400'>v2 FIXES ACTIVE:</b><br>
+        ✓ Intraday momentum gate<br>
+        ✓ VWAP gate (below = penalised)<br>
+        ✓ Directional Hawkes (sell spikes reduce λ)<br>
+        ✓ Lower-low detection<br>
+        ✓ Gap-down penalty<br><br>
         <b style='color:#ffb400'>CAP FILTER: $300M – $20B</b><br>
-        Large caps (AMZN, AAPL etc) auto-blocked.<br>
-        Stocks outside range are silently skipped.<br><br>
         Data: yfinance (daily + 1-min)<br>
-        Hawkes: 1-min volume events<br>
-        OFI: Bulk Volume Classification<br>
-        Hurst: Daily R/S Analysis<br><br>
         No API key required.
         </div>
         """, unsafe_allow_html=True)
 
     symbols = [s.strip().upper() for s in custom_syms.split("\n") if s.strip()]
 
-    # ── Auto-init state ────────────────────────────────────
     if "results" not in st.session_state:
         st.session_state["results"]    = pd.DataFrame()
         st.session_state["market"]     = {}
         st.session_state["last_scan"]  = 0.0
         st.session_state["scan_count"] = 0
 
-    # ── Trigger scan ───────────────────────────────────────
     now         = time.time()
     last        = st.session_state["last_scan"]
     should_scan = run_btn or (now - last > refresh) or last == 0
@@ -843,7 +872,7 @@ custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=3
     # ── Header ─────────────────────────────────────────────
     col1, col2 = st.columns([3, 1])
     with col1:
-        st.markdown('<div class="title">⚡ QUANT SCANNER</div>', unsafe_allow_html=True)
+        st.markdown('<div class="title">⚡ QUANT SCANNER v2</div>', unsafe_allow_html=True)
     with col2:
         st.markdown(
             f'<div class="meta" style="text-align:right;margin-top:8px">'
@@ -856,7 +885,7 @@ custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=3
     if market:
         regime_color = "#00ff8c" if "RISK-ON" in market.get("regime","") else (
                        "#ff4040" if "RISK-OFF" in market.get("regime","") else "#ffb400")
-        blocked_str  = (f" &nbsp;|&nbsp; 🚫 {market['blocked_count']} large-cap blocked"
+        blocked_str  = (f" &nbsp;|&nbsp; 🚫 {market['blocked_count']} blocked"
                         if market.get("blocked_count", 0) > 0 else "")
         st.markdown(
             f'<div class="market">MARKET: '
@@ -877,98 +906,75 @@ custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=3
         st.rerun()
         return
 
-    # ── Alert banner ───────────────────────────────────────
-    alerts = df[df["score"] >= threshold]
-    if not alerts.empty:
-        syms_str = "  ·  ".join(
-            f"{r['symbol']} [{r['score']}]" for _, r in alerts.iterrows()
-        )
-        st.markdown(
-            f'<div style="background:rgba(0,229,255,0.06);border:1px solid rgba(0,229,255,0.4);'
-            f'border-radius:6px;padding:10px 16px;margin-bottom:14px;'
-            f'font-family:Share Tech Mono;font-size:13px;color:#00e5ff;letter-spacing:2px;">'
-            f'▶ SIGNAL  ·  {syms_str}</div>',
-            unsafe_allow_html=True
-        )
-
     # ── Cards ──────────────────────────────────────────────
-    cols = st.columns(min(4, len(df)))
-    for i, (_, r) in enumerate(df.iterrows()):
-        score = r["score"]
-        color = ("#00ff8c" if score >= 75
-                 else "#00e5ff" if score >= threshold
-                 else "#ffb400" if score >= 45
-                 else "#ff4040")
-        card_cls = "card on" if score >= threshold else "card"
-        dec_str  = (f"⏱ {r['sig_remaining']}s" if r.get("sig_live") else
-                    "✗ EXPIRED" if r.get("just_expired") else "—")
+    alerts = df[df["alert"] == True]
+    others = df[df["alert"] == False]
 
-        card = f"""
-        <div class="{card_cls}">
+    def health_color(mult):
+        if mult >= 0.90: return "#00ff8c"
+        if mult >= 0.70: return "#ffb400"
+        return "#ff4040"
+
+    def render_card(r):
+        is_on   = r["alert"]
+        hm      = r["health_mult"]
+        hc      = health_color(hm)
+        css_cls = "on" if is_on and hm >= 0.90 else ("warn" if hm >= 0.50 else "off")
+        sc_col  = "#00ff8c" if r["score"] >= 75 else ("#ffb400" if r["score"] >= 60 else "#aaa")
+        vwap_str = f"{'🔴' if r['below_vwap'] else '🟢'} VWAP ${r['vwap']:.2f}"
+
+        st.markdown(f"""
+        <div class="card {css_cls}">
           <div style="display:flex;justify-content:space-between;align-items:flex-start">
             <div>
-              <div class="sym">{r['symbol']}</div>
-              <div class="meta">${r['price']} &nbsp;|&nbsp; MCap ${r.get('mcap_b', 0):.1f}B</div>
+              <span class="sym">{r['symbol']}</span>
+              <span class="meta" style="margin-left:12px">${r['price']}  MCap ${r.get('mcap_b',0):.1f}B</span>
             </div>
             <div style="text-align:right">
-              <div class="sc" style="color:{color}">{score}</div>
-              <div class="meta">SCORE</div>
+              <span class="sc" style="color:{sc_col}">{r['score']}</span>
+              <span class="meta"> /100</span><br>
+              <span class="meta" style="color:#556">raw {r['score_raw']}</span>
             </div>
           </div>
-          <div class="bar-bg">
-            <div class="bar-fg" style="width:{int(score)}%;background:{color}"></div>
+
+          <div style="margin:6px 0 4px">
+            <span class="health" style="background:{hc}22;color:{hc};border:1px solid {hc}44">
+              {r['health_label']}  ×{hm:.2f}
+            </span>
+            &nbsp;
+            <span class="meta">{vwap_str} &nbsp;|&nbsp;
+              intra {r['intraday_ret']:+.1f}% &nbsp;|&nbsp;
+              gap {r['gap_ret']:+.1f}%
+            </span>
           </div>
-          <div style="margin:6px 0">
-            <span class="tag" style="background:rgba(0,229,255,0.1);color:#00e5ff;border:1px solid rgba(0,229,255,0.3)">{r['hurst_regime']}</span>
-            <span class="tag" style="background:rgba(0,255,140,0.08);color:#00ff8c;border:1px solid rgba(0,255,140,0.25)">{r['hawkes_sig']}</span>
-            <span class="tag" style="background:rgba(255,180,0,0.08);color:#ffb400;border:1px solid rgba(255,180,0,0.25)">{r['ofi_sig']}</span>
+
+          <div class="bar-bg"><div class="bar-fg" style="width:{r['score']}%;background:{sc_col}"></div></div>
+
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+            <span class="tag" style="background:#1a2e40;color:#aac">{r['hurst_regime']}</span>
+            <span class="tag" style="background:#1a2e40;color:#aac">{r['hawkes_sig']}</span>
+            <span class="tag" style="background:#1a2e40;color:#aac">{r['ofi_sig']}</span>
+            <span class="tag" style="background:#1a2e40;color:#{'4af' if r['sector_gate'] else 'f44'}">{r['sector_etf']} RS {r['sector_rs']}</span>
           </div>
-          <div style="display:flex;gap:8px;margin-top:8px">
-            <div style="flex:1;background:#0a1520;border-radius:4px;padding:5px 8px">
-              <div class="meta">HURST H</div>
-              <div style="font-family:Share Tech Mono;font-size:13px;color:#a0c0d8">{r['hurst_H']}</div>
-            </div>
-            <div style="flex:1;background:#0a1520;border-radius:4px;padding:5px 8px">
-              <div class="meta">OFI</div>
-              <div style="font-family:Share Tech Mono;font-size:13px;color:#a0c0d8">{r['ofi']}</div>
-            </div>
-            <div style="flex:1;background:#0a1520;border-radius:4px;padding:5px 8px">
-              <div class="meta">SECTOR</div>
-              <div style="font-family:Share Tech Mono;font-size:13px;color:{'#00ff8c' if r['sector_gate'] else '#ff4040'}">{r['sector_etf']} {'✓' if r['sector_gate'] else '✗'}</div>
-            </div>
-          </div>
-          {"" if not r.get("alert") else f'''
-          <div class="trade">
-            <div class="meta">TRADE SETUP</div>
-            <div style="font-family:Share Tech Mono;font-size:12px;color:#c0d8e8">
-              Kelly {r['kelly_frac']:.1%} → {r['shares']} shares (${r['dollar_risk']} risk)<br>
-              Stop ${r['stop']} &nbsp;|&nbsp; Target ${r['target']} &nbsp;|&nbsp; {dec_str}
-            </div>
-          </div>
-          '''}
+
+          {'<div class="trade">' +
+           f'<span class="meta" style="color:#00ff8c">▶ ENTRY: ${r["price"]}  '
+           f'STOP: ${r["stop"]}  TARGET: ${r["target"]}  '
+           f'Kelly {r["kelly_frac"]:.1%} → {r["shares"]} shares  (${r["dollar_risk"]} risk)</span></div>'
+           if is_on else ''}
         </div>
-        """
-        with cols[i % len(cols)]:
-            st.markdown(card, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
-    # ── Summary table ──────────────────────────────────────
-    st.markdown("---")
-    display_cols = ["symbol", "mcap_b", "score", "hurst_regime", "hawkes_sig",
-                    "ofi_sig", "sector_etf", "kelly_frac", "shares",
-                    "stop", "target", "market"]
-    st.dataframe(
-        df[display_cols].rename(columns={
-            "symbol": "Symbol", "mcap_b": "MCap $B", "score": "Score",
-            "hurst_regime": "Regime", "hawkes_sig": "Hawkes",
-            "ofi_sig": "OFI", "sector_etf": "Sector",
-            "kelly_frac": "Kelly%", "shares": "Shares",
-            "stop": "Stop $", "target": "Target $", "market": "Mkt"
-        }),
-        use_container_width=True,  # noqa — use width='stretch' in future
-        hide_index=True,
-    )
+    if not alerts.empty:
+        st.markdown(f"### 🟢 Active Signals ({len(alerts)})")
+        for _, row in alerts.iterrows():
+            render_card(row)
+        st.markdown("---")
 
-    # Auto-refresh
+    st.markdown(f"### 📊 All Scanned ({len(df)})")
+    for _, row in df.iterrows():
+        render_card(row)
+
     time.sleep(refresh)
     st.rerun()
 
@@ -978,34 +984,9 @@ custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=3
 # ============================================================
 
 if __name__ == "__main__":
-    # Check if running via streamlit
-    if "streamlit" in sys.modules and hasattr(st, "session_state"):
+    if STREAMLIT_MODE and "streamlit" in sys.argv[0]:
         run_dashboard()
     else:
-        # Terminal mode — loop every POLL_INTERVAL seconds
-        print("""
-╔══════════════════════════════════════════════════════════╗
-║  QUANT SCANNER — YFINANCE BUILD                          ║
-║  No API key required. Data: yfinance (daily + 1-min)    ║
-║                                                          ║
-║  Terminal mode: python scanner_yf.py                    ║
-║  Dashboard:     streamlit run scanner_yf.py             ║
-╚══════════════════════════════════════════════════════════╝
-        """)
-        try:
-            while True:
-                df, market = run_full_scan(WATCHLIST)
-                if not df.empty:
-                    print_results(df, market)
-                    fname = f"scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-                    df.to_csv(fname, index=False)
-                    print(f"  Saved → {fname}")
-                print(f"  Next scan in {POLL_INTERVAL}s...  (Ctrl+C to stop)\n")
-                time.sleep(POLL_INTERVAL)
-        except KeyboardInterrupt:
-            print("\n  Scanner stopped.")
-
-# ── Streamlit entry: imported directly by streamlit ─────────
-else:
-    if STREAMLIT_MODE:
-        run_dashboard()
+        print("\n[QUANT SCANNER v2] Running terminal scan...\n")
+        df, market = run_full_scan()
+        print_results(df, market)
