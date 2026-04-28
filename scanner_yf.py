@@ -792,8 +792,13 @@ def run_dashboard():
         account     = st.number_input("Account Size ($)", value=int(ACCOUNT_SIZE),
                                        step=5000, format="%d")
         refresh     = st.slider("Refresh (sec)", 30, 300, POLL_INTERVAL)
-        custom_syms = st.text_area("Watchlist (one per line)",
-                                    value="\n".join(WATCHLIST), height=300)
+        # Try to load the automated list first
+if os.path.exists("auto_watchlist.txt"):
+    with open("auto_watchlist.txt", "r") as f:
+        auto_list = f.read()
+else:
+    auto_list = "\n".join(WATCHLIST)
+custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=300)
         run_btn     = st.button("▶ RUN SCAN NOW", use_container_width=True)  # noqa
         st.markdown("---")
         st.markdown("""
