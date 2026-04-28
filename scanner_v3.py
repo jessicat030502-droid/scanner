@@ -1,5 +1,3 @@
-python
-
 """
 ============================================================
   QUANT SCANNER + SIGNAL ENGINE — v3 UNIFIED
