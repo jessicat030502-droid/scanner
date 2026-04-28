@@ -816,16 +816,16 @@ def run_dashboard():
     """, unsafe_allow_html=True)
 
     # ── Sidebar ────────────────────────────────────────────
-      if os.path.exists("auto_watchlist.txt"):
+    if os.path.exists("auto_watchlist.txt"):
         with open("auto_watchlist.txt", "r") as f:
             auto_list = f.read()
-      else:
+    else:
         auto_list = "\n".join(WATCHLIST)
-        
-      custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=300)
-      run_btn = st.button("▶ RUN SCAN NOW", use_container_width=True)
-      st.markdown("---")
-      st.markdown("""
+
+    custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=300)
+    run_btn = st.button("▶ RUN SCAN NOW", use_container_width=True)
+    st.markdown("---")
+    st.markdown("""
         <div style='font-family:Share Tech Mono;font-size:11px;color:#2a4a62'>
         <b style='color:#ffb400'>v2 FIXES ACTIVE:</b><br>
         ✓ Intraday momentum gate<br>
