@@ -816,15 +816,15 @@ def run_dashboard():
     """, unsafe_allow_html=True)
 
     # ── Sidebar ────────────────────────────────────────────
- if os.path.exists("auto_watchlist.txt"):
+  if os.path.exists("auto_watchlist.txt"):
         with open("auto_watchlist.txt", "r") as f:
             auto_list = f.read()
-    else:
+  else:
         auto_list = "\n".join(WATCHLIST)
 
-    # All these MUST start at the exact same column
-    custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=300)
-    run_btn = st.button("▶ RUN SCAN NOW", use_container_width=True)
+  custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=300)
+  run_btn = st.button("▶ RUN SCAN NOW", use_container_width=True)
+    
     st.markdown("---")
     st.markdown("""
         <div style='font-family:Share Tech Mono;font-size:11px;color:#2a4a62'>
@@ -835,7 +835,6 @@ def run_dashboard():
         ✓ Lower-low detection<br>
         ✓ Gap-down penalty<br><br>
     """, unsafe_allow_html=True)
-
     # ── Header ─────────────────────────────────────────────
     col1, col2 = st.columns([3, 1])
     with col1:
