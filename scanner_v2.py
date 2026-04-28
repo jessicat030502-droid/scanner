@@ -816,22 +816,17 @@ def run_dashboard():
     """, unsafe_allow_html=True)
 
     # ── Sidebar ────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("### ⚙ CONTROLS")
-        threshold   = st.slider("Signal Threshold", 40, 90, SIGNAL_THRESHOLD)
-        account     = st.number_input("Account Size ($)", value=int(ACCOUNT_SIZE),
-                                       step=5000, format="%d")
-        refresh     = st.slider("Refresh (sec)", 30, 300, POLL_INTERVAL)
-        # Try to load the automated list first
-if os.path.exists("auto_watchlist.txt"):
-    with open("auto_watchlist.txt", "r") as f:
-        auto_list = f.read()
-else:
-    auto_list = "\n".join(WATCHLIST)
-custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=300)
+ if os.path.exists("auto_watchlist.txt"):
+        with open("auto_watchlist.txt", "r") as f:
+            auto_list = f.read()
+    else:
+        auto_list = "\n".join(WATCHLIST)
+
+    # All these MUST start at the exact same column
+    custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=300)
     run_btn = st.button("▶ RUN SCAN NOW", use_container_width=True)
-        st.markdown("---")
-        st.markdown("""
+    st.markdown("---")
+    st.markdown("""
         <div style='font-family:Share Tech Mono;font-size:11px;color:#2a4a62'>
         <b style='color:#ffb400'>v2 FIXES ACTIVE:</b><br>
         ✓ Intraday momentum gate<br>
@@ -839,35 +834,7 @@ custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=3
         ✓ Directional Hawkes (sell spikes reduce λ)<br>
         ✓ Lower-low detection<br>
         ✓ Gap-down penalty<br><br>
-        <b style='color:#ffb400'>CAP FILTER: $300M – $20B</b><br>
-        Data: yfinance (daily + 1-min)<br>
-        No API key required.
-        </div>
-        """, unsafe_allow_html=True)
-
-    symbols = [s.strip().upper() for s in custom_syms.split("\n") if s.strip()]
-
-    if "results" not in st.session_state:
-        st.session_state["results"]    = pd.DataFrame()
-        st.session_state["market"]     = {}
-        st.session_state["last_scan"]  = 0.0
-        st.session_state["scan_count"] = 0
-
-    now         = time.time()
-    last        = st.session_state["last_scan"]
-    should_scan = run_btn or (now - last > refresh) or last == 0
-
-    if should_scan:
-        with st.spinner("Scanning..."):
-            df, market = run_full_scan(symbols)
-        st.session_state["results"]    = df
-        st.session_state["market"]     = market
-        st.session_state["last_scan"]  = now
-        st.session_state["scan_count"] += 1
-
-    df     = st.session_state["results"]
-    market = st.session_state["market"]
-    count  = st.session_state["scan_count"]
+    """, unsafe_allow_html=True)
 
     # ── Header ─────────────────────────────────────────────
     col1, col2 = st.columns([3, 1])
