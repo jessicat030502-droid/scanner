@@ -829,7 +829,7 @@ if os.path.exists("auto_watchlist.txt"):
 else:
     auto_list = "\n".join(WATCHLIST)
 custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=300)
-    run_btn     = st.button("▶ RUN SCAN NOW", use_container_width=True)
+    run_btn = st.button("▶ RUN SCAN NOW", use_container_width=True)
         st.markdown("---")
         st.markdown("""
         <div style='font-family:Share Tech Mono;font-size:11px;color:#2a4a62'>
