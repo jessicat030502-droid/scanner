@@ -1,70 +1,26 @@
 """
-============================================================
-  QUANT SCANNER + SIGNAL ENGINE — v3 UNIFIED
-  scanner_v3.py
+QUANT SCANNER v3 — Mid/Small Cap Day Trading Engine
+=====================================================
+Run:   python -m streamlit run scanner_v3.py
+Deps:  pip install yfinance pandas numpy scipy streamlit openpyxl schedule
 
-  WHAT'S NEW IN v3
-  ─────────────────
-  NEW 1 — ADD Breadth Gate
-      Uses SPY advancing/declining volume as $ADD proxy.
-      Schwab live $ADD when credentials active.
-      Blocks all longs when market internals are bearish.
+10 Layers: Hurst · Hawkes · OFI · Sector RS · ADD Breadth ·
+           Z-Score · Kurtosis/Skew · Bayesian Prob · Half-Life · ATR R:R
 
-  NEW 2 — Z-Score Exhaustion Gate
-      Calculates how many σ price is from its 20-bar mean.
-      Z > 2.5 → move already overextended → BLOCK entry.
-      Prevents "buying the top" of an exhausted move.
-
-  NEW 3 — Kurtosis & Skewness Filter
-      Kurtosis > 3.0 → fat tails → outlier moves likely.
-      Positive skew → upside outliers more probable (LONG).
-      Negative skew → downside outliers more probable (SHORT).
-      Finds the stocks where BIG fast moves actually happen.
-
-  NEW 4 — Bayesian Probability Score
-      Stacks ADD + Sector RS + Hawkes into conditional
-      win probability using Bayes' theorem.
-      P(Win | ADD, Sector, Hawkes) shown as % on each card.
-
-  NEW 5 — Alpha Half-Life Decay
-      Signal strength decays exponentially from fire time.
-      Decay rate = f(signal strength, ATR volatility).
-      Stronger signals get longer half-life. Replaces flat TTL.
-
-  TIMEFRAME TOGGLE (sidebar)
-      15s / 1m / 5m / 15m — all selectable live.
-
-  DATA SOURCE TOGGLE (sidebar)
-      Schwab API (live streaming) or yfinance (fallback).
-      Schwab unlocks: real $ADD, Level 1 bid size,
-      true TIMESALE tick stream for half-life calc.
-
-  INSTALL
-  ───────
-  pip install yfinance pandas numpy streamlit schwab-py
-
-  ENV VARS (Schwab — set when ready):
-      SCHWAB_API_KEY=...
-      SCHWAB_API_SECRET=...
-      SCHWAB_CALLBACK_URL=https://127.0.0.1
-      ACCOUNT_SIZE=50000
-
-  RUN
-  ───
-  python -m streamlit run scanner_v3.py
-============================================================
+Universe Scanner auto-runs at 9:00 AM EST daily.
+Cap filter: $300M–$20B. Timeframe: 15s / 1m / 5m / 15m toggle.
 """
 
-import os, sys, time, math, warnings, threading
+import os, time, math, warnings, threading
 import numpy as np
 import pandas as pd
 from datetime import datetime
+from dataclasses import dataclass
 from typing import Optional
-from dataclasses import dataclass, field
-from collections import deque
-from scipy import stats as scipy_stats
-
+from scipy import stats as sp_stats
 import yfinance as yf
+import schedule
+
 warnings.filterwarnings("ignore")
 
 try:
@@ -75,15 +31,12 @@ except ImportError:
 
 try:
     import schwab
-    from schwab.streaming import StreamClient
     SCHWAB_AVAILABLE = True
 except ImportError:
     SCHWAB_AVAILABLE = False
 
 
-# ============================================================
-#  CONFIG
-# ============================================================
+# ── Config ────────────────────────────────────────────────────────────────────
 
 WATCHLIST = [
     "CRUS","POWI","MTSI","JAMF","ALKT","TASK",
@@ -92,8 +45,7 @@ WATCHLIST = [
     "CURO","OPFI","HIBB","GCMG","NRDS",
     "CIVI","BATL","REX","PTEN","WTTR",
     "KTOS","ASTE","HLIO","DLX","HAYW",
-    "TROX","RYAM","KWR",
-    "NTST","GMRE","EPRT",
+    "TROX","RYAM","KWR","NTST","GMRE","EPRT",
 ]
 
 SECTOR_MAP = {
@@ -107,71 +59,77 @@ SECTOR_MAP = {
     "NTST":"XLRE","GMRE":"XLRE","EPRT":"XLRE",
 }
 
-MIDCAP_MIN        = 300_000_000
-MIDCAP_MAX        = 20_000_000_000
-ACCOUNT_SIZE      = float(os.environ.get("ACCOUNT_SIZE", 50000))
-SIGNAL_THRESHOLD  = 65
-ATR_STOP_MULT     = 1.5
-ATR_TARGET_MULT   = 3.0
-SPY_WEAK_THRESH   = -0.005
-SECTOR_RS_MIN     = 1.02
-HAWKES_DECAY      = 0.3
-OFI_LONG_ENTRY    = 0.60
-OFI_SHORT_ENTRY   = 0.40
-OFI_LONG_EXIT     = 0.45
-OFI_SHORT_EXIT    = 0.55
-HAWKES_MIN_SLOPE  = 0.02
+UNIVERSE = list(dict.fromkeys([
+    "CRUS","POWI","MTSI","JAMF","ALKT","TASK","APPF","VCRA","DOMO","EVER",
+    "INVA","TNDM","HAYW","ASTE","KTOS","DLX","HLIO","TROX","RYAM","KWR",
+    "NTST","GMRE","EPRT","CIVI","PTEN","WTTR","BOOT","GIII","PLAY","LESL",
+    "PRPL","HIMS","ACAD","PDCO","HCAT","NVCR","GKOS","CURO","OPFI","GCMG",
+    "AXNX","PRCT","ARVN","ARWR","FOLD","IMVT","KRYS","LGND","MYGN","NKTR",
+    "NVAX","PCRX","RARE","RCUS","SRPT","TGTX","ABR","AIV","ALEX","AMH",
+    "STAG","CUBE","DEA","EFC","EQC","FBRT","GOOD","HIW","AMRX","ATRC",
+    "BCPC","BLKB","BPOP","CABO","CADE","CARG","CBT","CCOI","CDRE","CEVA",
+    "CHCO","CHDN","CHEF","CHGG","CIR","CLAR","CLDT","CLW","CMCO","CNMD",
+    "CNSL","COHU","CONN","COUP","CRVL","CTBI","CVBF","CVCO","CVLT","CWST",
+    "DAN","DBRG","DIN","DIOD","DXLG","EAT","ECPG","EGAN","EGHT","ELME",
+    "EML","ENVA","EPAC","ERII","ESRT","ETSY","EVGO","EVTC","EXLS","EXPI",
+    "EXPO","EZPW","FARO","FBMS","FELE","FGEN","FISI","FLNC","FLR","FMBH",
+    "FORM","FORR","FOXF","FRME","FRST","FSTR","FTDR","GDEN","GDOT","GEOS",
+    "GIFI","GLDD","GLNG","GNSS","GNW","GPOR","GPRE","GRPN","GSBC","GSHD",
+    "GTLS","HAFC","HAIN","HALO","HASI","HBT","HCC","HCSG","HEES","HELE",
+    "HFWA","HIBB","HIIQ","HIMX","HLX","HMST","HOPE","HROW","HRMY","HSII",
+    "HTBK","HTLD","HTLF","HURC","HURN","HVT","HWKN","IART","IBTX","ICFI",
+    "ICHR","IDCC","IDYA","IESC","IIPR","IMCR","INDB","INMD","INSM","IONS",
+    "IPAR","IRDM","IRTC","ITRI","JACK","JBSS","JJSF","KELYA","KMPR","KNTK",
+    "KVHI","LBAI","LCII","LCUT","LECO","LKFN","LMAT","LNTH","LOVE","LPRO",
+    "LQDT","LSCC","LSTR","LTHM","LYTS","MARA","MATW","MATX","MBIN","MBWM",
+    "MCRI","MDGL","MDRX","MERC","MFIN","MGNI","MGPI","MLAB","MMSI","MNKD",
+    "MNRO","MODV","MOFG","MORN","MRCY","MRTN","MRUS","MSEX","MTDR","MVBF",
+    "NATH","NBTB","NCBS","NDLS","NEOG","NESR","NEXT","NFBK","NLSN","NMFC",
+    "NMIH","NNBR","NOMD","NOVT","NSP","NTGR","NTRA","NWBI","NXRT","NYCB",
+    "OBNK","OCFC","OCGN","OCSL","OCUL","OFG","OGS","OMCL","OPCH","OPRT",
+]))
 
-# NEW 2 — Z-Score exhaustion threshold
-ZSCORE_MAX        = 2.5    # block long entry if Z > this
-ZSCORE_MIN        = -2.5   # block short entry if Z < this
-
-# NEW 3 — Kurtosis / Skewness minimums
-KURTOSIS_MIN      = 3.0    # excess kurtosis > 3 = fat tails
-SKEW_LONG_MIN     = 0.1    # positive skew for longs
-SKEW_SHORT_MAX    = -0.1   # negative skew for shorts
-
-# NEW 4 — Bayesian base rates (tune after 50+ trades)
-BAYES_BASE_WIN    = 0.50   # random base rate
-BAYES_ADD_BOOST   = 0.08   # ADD breadth adds ~8%
-BAYES_SECTOR_BOOST= 0.10   # sector RS adds ~10%
-BAYES_HAWKES_BOOST= 0.14   # Hawkes clustering adds ~14%
-
-# NEW 5 — Half-life decay params
-HALFLIFE_BASE_SEC = 600    # base half-life 10 min
-HALFLIFE_MIN_SEC  = 120    # floor: 2 min
-HALFLIFE_MAX_SEC  = 1800   # ceiling: 30 min
-
-# Intraday health thresholds (v2)
-INTRADAY_SOFT_WARN = -0.010
-INTRADAY_HARD_WARN = -0.020
-INTRADAY_KILL      = -0.030
-GAP_DOWN_THRESH    = -0.010
-LOWER_LOW_BARS     = 6
-
-# Timeframe options → yfinance interval strings
-TIMEFRAME_OPTIONS  = {
-    "15s":  "15s",   # yfinance doesn't support 15s — we simulate via 1m
-    "1m":   "1m",
-    "5m":   "5m",
-    "15m":  "15m",
-}
-DEFAULT_TIMEFRAME  = "5m"
+# Thresholds — edit these to tune the engine
+MIDCAP_MIN       = 300_000_000
+MIDCAP_MAX       = 20_000_000_000
+ACCOUNT_SIZE     = float(os.environ.get("ACCOUNT_SIZE", 50000))
+SIGNAL_THRESHOLD = 65
+ATR_STOP_MULT    = 1.5
+ATR_TARGET_MULT  = 3.0
+SPY_WEAK_THRESH  = -0.005
+SECTOR_RS_MIN    = 1.02
+HAWKES_DECAY     = 0.3
+OFI_LONG_ENTRY   = 0.60
+OFI_SHORT_ENTRY  = 0.40
+OFI_LONG_EXIT    = 0.45
+OFI_SHORT_EXIT   = 0.55
+ZSCORE_MAX       = 2.5
+ZSCORE_MIN       = -2.5
+KURTOSIS_MIN     = 3.0
+SKEW_LONG_MIN    = 0.1
+SKEW_SHORT_MAX   = -0.1
+BAYES_BASE       = 0.50
+BAYES_ADD        = 0.08
+BAYES_SECTOR     = 0.10
+BAYES_HAWKES     = 0.14
+HALFLIFE_BASE    = 600
+HALFLIFE_MIN     = 120
+HALFLIFE_MAX     = 1800
+INTRADAY_SOFT    = -0.010
+INTRADAY_HARD    = -0.020
+INTRADAY_KILL    = -0.030
+GAP_DOWN_THRESH  = -0.010
+LOWER_LOW_BARS   = 6
 
 
-# ============================================================
-#  MCAP CACHE
-# ============================================================
+# ── Market Cap Filter ─────────────────────────────────────────────────────────
 
 _mcap_cache: dict = {}
-MCAP_CACHE_TTL = 3600
 
 def get_market_cap(symbol: str) -> Optional[float]:
     now = time.time()
-    if symbol in _mcap_cache:
-        mcap, ts = _mcap_cache[symbol]
-        if now - ts < MCAP_CACHE_TTL:
-            return mcap
+    if symbol in _mcap_cache and now - _mcap_cache[symbol][1] < 3600:
+        return _mcap_cache[symbol][0]
     try:
         info = yf.Ticker(symbol).info
         mcap = info.get("marketCap") or info.get("enterpriseValue")
@@ -189,9 +147,7 @@ def is_midcap(symbol: str) -> tuple:
     return MIDCAP_MIN <= mcap <= MIDCAP_MAX, round(mcap / 1e9, 2)
 
 
-# ============================================================
-#  DATA FETCHERS
-# ============================================================
+# ── Data Fetchers ─────────────────────────────────────────────────────────────
 
 def fetch_daily(symbol: str, n: int = 60) -> Optional[pd.DataFrame]:
     try:
@@ -204,10 +160,6 @@ def fetch_daily(symbol: str, n: int = 60) -> Optional[pd.DataFrame]:
         return None
 
 def fetch_intraday(symbol: str, timeframe: str = "5m") -> Optional[pd.DataFrame]:
-    """
-    Fetch intraday bars. 15s is not supported by yfinance —
-    we fetch 1m and resample to approximate 15s bars.
-    """
     try:
         interval = "1m" if timeframe == "15s" else timeframe
         period   = "5d" if timeframe in ("5m","15m") else "1d"
@@ -216,21 +168,11 @@ def fetch_intraday(symbol: str, timeframe: str = "5m") -> Optional[pd.DataFrame]
             return None
         df.columns = [c.lower() for c in df.columns]
         df = df[["open","high","low","close","volume"]].dropna()
-
-        # Resample 1m → approximate 15s by splitting each bar into 4
         if timeframe == "15s":
-            rows = []
-            for _, row in df.iterrows():
-                for q in range(4):
-                    rows.append({
-                        "open":   row["open"],
-                        "high":   row["high"],
-                        "low":    row["low"],
-                        "close":  row["close"],
-                        "volume": row["volume"] / 4,
-                    })
+            rows = [{"open":r["open"],"high":r["high"],"low":r["low"],
+                     "close":r["close"],"volume":r["volume"]/4}
+                    for _, r in df.iterrows() for _ in range(4)]
             df = pd.DataFrame(rows)
-
         return df
     except Exception:
         return None
@@ -240,301 +182,128 @@ def fetch_closes(symbol: str, n: int = 25) -> Optional[np.ndarray]:
     return df["close"].values if df is not None else None
 
 
-# ============================================================
-#  NEW 1: ADD BREADTH GATE
-#  $ADD = NYSE Advancing Issues − Declining Issues.
-#  When ADD > 0, more stocks are rising than falling —
-#  the "tide" is rising and momentum longs have tailwind.
-#
-#  yfinance proxy: SPY up-volume / total-volume ratio.
-#  If > 0.55 → breadth positive (ADD proxy bullish).
-#  Schwab mode: streams real-time $ADD quote when available.
-# ============================================================
+# ── ADD Breadth (SPY up-volume proxy, updates every 60s) ──────────────────────
 
-_add_cache: dict = {"value": 0.0, "bullish": True, "updated": 0.0}
-_add_lock = threading.Lock()
+_add_cache = {"value": 0.0, "bullish": True, "updated": 0.0}
+_add_lock  = threading.Lock()
 
-def update_add_breadth_yf():
-    """
-    Computes ADD proxy from SPY 1-min bars.
-    Up-volume / total-volume > 0.55 = advancing breadth.
-    Runs in background thread, updates every 60 seconds.
-    """
+def _update_add_loop():
     while True:
         try:
             df = yf.Ticker("SPY").history(period="1d", interval="1m")
             if not df.empty:
                 df.columns = [c.lower() for c in df.columns]
-                close = df["close"].values
-                vol   = df["volume"].values
-                bar_range = df["high"].values - df["low"].values
-                buy_r = np.where(bar_range > 0,
-                                 (close - df["low"].values) / bar_range, 0.5)
-                up_vol  = (buy_r * vol).sum()
-                tot_vol = vol.sum()
-                ratio   = up_vol / tot_vol if tot_vol > 0 else 0.5
-                bullish = ratio > 0.52
+                rng   = df["high"].values - df["low"].values
+                br    = np.where(rng > 0, (df["close"].values - df["low"].values) / rng, 0.5)
+                ratio = (br * df["volume"].values).sum() / df["volume"].values.sum()
                 with _add_lock:
-                    _add_cache["value"]   = round(ratio, 4)
-                    _add_cache["bullish"] = bullish
-                    _add_cache["updated"] = time.time()
+                    _add_cache.update({"value":round(ratio,4), "bullish":ratio>0.52, "updated":time.time()})
         except Exception:
             pass
         time.sleep(60)
 
-def get_add_breadth() -> tuple[float, bool]:
-    """Returns (add_proxy_value, is_bullish)."""
+def get_add_breadth() -> tuple:
     with _add_lock:
         return _add_cache["value"], _add_cache["bullish"]
 
 def add_score(bullish: bool) -> float:
-    """Score contribution from ADD breadth: 70 if bullish, 30 if not."""
     return 70.0 if bullish else 30.0
 
 
-# ============================================================
-#  NEW 2: Z-SCORE EXHAUSTION GATE
-#  Z = (price − SMA20) / StdDev20
-#  Z > 2.5 → price is 2.5σ above mean → overextended.
-#  Buying here = buying the top. BLOCK the entry.
-#  Z < -2.5 → overextended to downside → block short entry.
-#
-#  Professional rule: at 3σ, >99.7% of price action is
-#  within this range — the move is statistically exhausted.
-# ============================================================
+# ── Z-Score (exhaustion gate) ─────────────────────────────────────────────────
 
 def compute_zscore(prices: np.ndarray, window: int = 20) -> float:
-    """
-    Z-score of current price relative to rolling 20-bar mean.
-    Uses daily closes for stability.
-    """
     if len(prices) < window:
         return 0.0
-    recent = prices[-window:]
-    mean   = np.mean(recent)
-    std    = np.std(recent, ddof=1)
-    if std == 0:
-        return 0.0
-    return float((prices[-1] - mean) / std)
+    s = np.std(prices[-window:], ddof=1)
+    return float((prices[-1] - np.mean(prices[-window:])) / s) if s else 0.0
 
-def zscore_gate(z: float, direction: str) -> tuple[bool, str]:
-    """
-    Returns (passes, reason).
-    Blocks long entry if Z > ZSCORE_MAX (overextended up).
-    Blocks short entry if Z < ZSCORE_MIN (overextended down).
-    """
-    if direction == "LONG" and z > ZSCORE_MAX:
-        return False, f"Z={z:.2f} > {ZSCORE_MAX} — EXHAUSTED UP"
-    if direction == "SHORT" and z < ZSCORE_MIN:
-        return False, f"Z={z:.2f} < {ZSCORE_MIN} — EXHAUSTED DOWN"
+def zscore_gate(z: float, direction: str) -> tuple:
+    if direction == "LONG"  and z >  ZSCORE_MAX: return False, f"Z={z:.2f} EXHAUSTED"
+    if direction == "SHORT" and z <  ZSCORE_MIN: return False, f"Z={z:.2f} EXHAUSTED"
     return True, f"Z={z:.2f} ✓"
 
 def zscore_score(z: float) -> float:
-    """
-    Score 0-100. Near zero = ideal (50-75). Extremes = penalised.
-    """
     return float(np.clip(100 - abs(z) * 20, 0, 100))
 
 
-# ============================================================
-#  NEW 3: KURTOSIS & SKEWNESS FILTER
-#  Finds stocks where big fast moves are most statistically
-#  likely — the "hunting ground" for day trades.
-#
-#  Kurtosis > 3.0 → fat tails → outlier moves common.
-#  Positive skew → right tail fatter → big up moves likely.
-#  Negative skew → left tail fatter → big down moves likely.
-#
-#  Use: only trade stocks where kurtosis is elevated AND
-#  skew aligns with your intended direction.
-# ============================================================
+# ── Kurtosis & Skewness (fat-tail filter) ─────────────────────────────────────
 
-def compute_kurtosis_skew(prices: np.ndarray) -> tuple[float, float]:
-    """
-    Returns (excess_kurtosis, skewness) of log returns.
-    Uses log returns so results are comparable across stocks.
-    """
+def compute_kurtosis_skew(prices: np.ndarray) -> tuple:
     if len(prices) < 20:
         return 0.0, 0.0
     log_r = np.diff(np.log(prices + 1e-9))
-    kurt  = float(scipy_stats.kurtosis(log_r, fisher=True))   # excess kurtosis
-    skew  = float(scipy_stats.skew(log_r))
-    return round(kurt, 3), round(skew, 3)
+    return round(float(sp_stats.kurtosis(log_r, fisher=True)), 3), \
+           round(float(sp_stats.skew(log_r)), 3)
 
-def kurtosis_skew_score(kurt: float, skew: float,
-                         direction: str = "LONG") -> tuple[float, str]:
-    """
-    Returns (score_0_100, label).
-    Fat tails = good (higher score).
-    Skew aligned with direction = bonus.
-    """
-    # Base score from kurtosis
-    base = float(np.clip((kurt / 6.0) * 60, 0, 60))   # 0-60 pts
-
-    # Skew alignment bonus (0-40 pts)
-    if direction == "LONG" and skew > SKEW_LONG_MIN:
-        skew_bonus = float(np.clip(skew * 20, 0, 40))
-    elif direction == "SHORT" and skew < SKEW_SHORT_MAX:
-        skew_bonus = float(np.clip(abs(skew) * 20, 0, 40))
-    else:
-        skew_bonus = 0.0
-
-    score = round(base + skew_bonus, 1)
-
-    if kurt > 5.0 and score > 70:
-        label = "🎯 FAT TAIL"
-    elif kurt > KURTOSIS_MIN:
-        label = "📊 ELEVATED"
-    else:
-        label = "〰 NORMAL"
-
+def kurtosis_skew_score(kurt: float, skew: float, direction: str = "LONG") -> tuple:
+    base  = float(np.clip((kurt / 6.0) * 60, 0, 60))
+    bonus = 0.0
+    if direction == "LONG"  and skew >  SKEW_LONG_MIN:  bonus = float(np.clip(skew      * 20, 0, 40))
+    if direction == "SHORT" and skew <  SKEW_SHORT_MAX:  bonus = float(np.clip(abs(skew) * 20, 0, 40))
+    score = round(base + bonus, 1)
+    label = "🎯 FAT TAIL" if kurt > 5.0 and score > 70 else \
+            "📊 ELEVATED" if kurt > KURTOSIS_MIN else "〰 NORMAL"
     return score, label
 
 
-# ============================================================
-#  NEW 4: BAYESIAN PROBABILITY SCORE
-#  Stacks independent signals using Bayes' theorem to compute
-#  the true conditional win probability given all conditions.
-#
-#  P(W|ADD,Sector,Hawkes) = updated sequentially:
-#    Start: 50% base rate
-#    If ADD bullish: +8%
-#    If Sector outperforming: +10%
-#    If Hawkes clustering: +14%
-#  Each condition updates the posterior probability.
-# ============================================================
+# ── Bayesian Win Probability ──────────────────────────────────────────────────
 
-def bayesian_win_prob(add_bullish: bool, sector_gate: bool,
-                       hawkes_score: float, zscore_ok: bool,
-                       kurt_score: float) -> tuple[float, list]:
-    """
-    Returns (win_probability_0_to_1, factor_list).
-    Sequential Bayesian update from base rate.
-    """
-    p = BAYES_BASE_WIN
-    factors = [f"Base: {p:.0%}"]
+def bayesian_win_prob(add_bull: bool, sector_ok: bool,
+                      hawk_sc: float, z_ok: bool, ks_sc: float) -> tuple:
+    p, log = BAYES_BASE, [f"Base: {BAYES_BASE:.0%}"]
 
-    # ADD breadth
-    if add_bullish:
-        p = min(0.97, p + BAYES_ADD_BOOST)
-        factors.append(f"ADD ↑ +{BAYES_ADD_BOOST:.0%} → {p:.0%}")
-    else:
-        p = max(0.03, p - BAYES_ADD_BOOST)
-        factors.append(f"ADD ↓ -{BAYES_ADD_BOOST:.0%} → {p:.0%}")
+    def upd(cond, boost, label):
+        nonlocal p
+        p = float(np.clip(p + (boost if cond else -boost * 0.5), 0.03, 0.97))
+        log.append(f"{label} → {p:.0%}")
 
-    # Sector RS
-    if sector_gate:
-        p = min(0.97, p + BAYES_SECTOR_BOOST)
-        factors.append(f"Sector ↑ +{BAYES_SECTOR_BOOST:.0%} → {p:.0%}")
-    else:
-        p = max(0.03, p - BAYES_SECTOR_BOOST * 0.5)
-        factors.append(f"Sector weak → {p:.0%}")
+    upd(add_bull,         BAYES_ADD,    f"ADD {'↑' if add_bull else '↓'}")
+    upd(sector_ok,        BAYES_SECTOR, f"Sector {'✓' if sector_ok else '✗'}")
+    upd(hawk_sc >= 72,    BAYES_HAWKES, f"Hawkes {'🔥' if hawk_sc>=72 else '⚡' if hawk_sc>=58 else '—'}")
+    upd(z_ok,             0.04,         f"Z {'✓' if z_ok else '✗'}")
+    if ks_sc >= 60:
+        p = float(np.clip(p + 0.05, 0.03, 0.97))
+        log.append(f"FatTail → {p:.0%}")
 
-    # Hawkes intensity
-    if hawkes_score >= 72:
-        p = min(0.97, p + BAYES_HAWKES_BOOST)
-        factors.append(f"Hawkes 🔥 +{BAYES_HAWKES_BOOST:.0%} → {p:.0%}")
-    elif hawkes_score >= 58:
-        p = min(0.97, p + BAYES_HAWKES_BOOST * 0.5)
-        factors.append(f"Hawkes ⚡ +{BAYES_HAWKES_BOOST*0.5:.0%} → {p:.0%}")
-
-    # Z-score (not exhausted = bonus)
-    if zscore_ok:
-        p = min(0.97, p + 0.04)
-        factors.append(f"Z-ok +4% → {p:.0%}")
-    else:
-        p = max(0.03, p - 0.12)
-        factors.append(f"Z-exhausted -12% → {p:.0%}")
-
-    # Fat tails (outlier move likely)
-    if kurt_score >= 60:
-        p = min(0.97, p + 0.05)
-        factors.append(f"FatTail +5% → {p:.0%}")
-
-    return round(p, 4), factors
+    return round(p, 4), log
 
 
-# ============================================================
-#  NEW 5: ALPHA HALF-LIFE DECAY
-#  Replaces the flat 10-min TTL with true exponential decay.
-#
-#  Signal strength S(t) = S₀ × exp(−λt)
-#  where λ = ln(2) / half_life
-#
-#  Half-life is dynamic:
-#    Strong signals (score > 80) → longer half-life (20 min)
-#    Weak signals  (score < 60) → shorter half-life (3 min)
-#    ATR volatility adjusts: high vol = faster decay
-#
-#  Signal considered "alive" while S(t) > 0.25 × S₀
-#  (25% of original strength remaining)
-# ============================================================
+# ── Alpha Half-Life Decay ─────────────────────────────────────────────────────
 
-_signal_start: dict[str, dict] = {}
+_signal_start: dict = {}
 
 def compute_halflife(score: float, atr_pct: float) -> float:
-    """
-    Dynamic half-life in seconds based on signal strength and volatility.
-    atr_pct = ATR / price (e.g. 0.02 = 2% ATR)
-    """
-    # Base: stronger signal = longer half-life
-    base = HALFLIFE_BASE_SEC * (score / 65.0)
+    return float(np.clip(HALFLIFE_BASE * (score / 65.0) / (1.0 + atr_pct * 10),
+                         HALFLIFE_MIN, HALFLIFE_MAX))
 
-    # Volatility adjustment: high vol = faster decay
-    vol_factor = 1.0 / (1.0 + atr_pct * 10)
-
-    hl = base * vol_factor
-    return float(np.clip(hl, HALFLIFE_MIN_SEC, HALFLIFE_MAX_SEC))
-
-def halflife_remaining(symbol: str, current_score: float,
-                        current_price: float, atr: float) -> tuple[float, float, bool]:
-    """
-    Returns (strength_pct, seconds_remaining, is_alive).
-    strength_pct: how much of original signal remains (0.0-1.0)
-    """
-    now = time.time()
-    atr_pct = (atr / current_price) if current_price > 0 else 0.02
-
-    # Register new signal
-    if symbol not in _signal_start or current_score < SIGNAL_THRESHOLD:
-        if current_score >= SIGNAL_THRESHOLD:
-            hl = compute_halflife(current_score, atr_pct)
-            _signal_start[symbol] = {
-                "time":     now,
-                "score":    current_score,
-                "halflife": hl,
-                "lambda":   math.log(2) / hl,
-            }
-        else:
-            _signal_start.pop(symbol, None)
-            return 0.0, 0.0, False
-
-    sig = _signal_start[symbol]
-    elapsed  = now - sig["time"]
-    strength = math.exp(-sig["lambda"] * elapsed)
-    hl       = sig["halflife"]
-    remaining = max(0.0, hl * (math.log(strength) / math.log(0.5))) if strength > 0 else 0.0
-
-    # Alive while strength > 25% of original
-    alive = strength > 0.25
-
+def halflife_remaining(symbol: str, score: float, price: float, atr: float) -> tuple:
+    now     = time.time()
+    atr_pct = (atr / price) if price > 0 else 0.02
+    if score < SIGNAL_THRESHOLD:
+        _signal_start.pop(symbol, None)
+        return 0.0, 0.0, False
+    if symbol not in _signal_start:
+        hl = compute_halflife(score, atr_pct)
+        _signal_start[symbol] = {"time": now, "halflife": hl, "lambda": math.log(2) / hl}
+    sig      = _signal_start[symbol]
+    strength = math.exp(-sig["lambda"] * (now - sig["time"]))
+    remaining = max(0.0, sig["halflife"] * math.log(max(strength,1e-9)) / math.log(0.5))
+    alive    = strength > 0.25
     if not alive:
         _signal_start.pop(symbol, None)
-
     return round(strength, 4), round(remaining, 1), alive
 
 
-# ============================================================
-#  CORE INDICATORS (from v2 — unchanged)
-# ============================================================
+# ── Core Indicators ───────────────────────────────────────────────────────────
 
 def compute_hurst(prices: np.ndarray) -> float:
     arr = np.array(prices)
     if len(arr) < 30: return 0.5
     log_r = np.diff(np.log(arr + 1e-9))
-    n = len(log_r)
-    lags = np.unique(np.floor(np.geomspace(5, n//2, 12)).astype(int))
-    lags = lags[lags >= 4]
+    n     = len(log_r)
+    lags  = np.unique(np.floor(np.geomspace(5, n//2, 12)).astype(int))
+    lags  = lags[lags >= 4]
     rs_v, vl = [], []
     for lag in lags:
         nw = n // lag
@@ -544,147 +313,149 @@ def compute_hurst(prices: np.ndarray) -> float:
             seg = log_r[i*lag:(i+1)*lag]
             cs  = np.cumsum(seg - seg.mean())
             S   = seg.std(ddof=1)
-            if S > 0: rl.append((cs.max()-cs.min())/S)
+            if S > 0: rl.append((cs.max() - cs.min()) / S)
         if rl: rs_v.append(np.mean(rl)); vl.append(lag)
     if len(vl) < 3: return 0.5
     H, _ = np.polyfit(np.log(vl), np.log(rs_v), 1)
     return float(np.clip(H, 0.0, 1.0))
 
-def hurst_score(H): return float(np.clip((H-0.5)*200+50, 0, 100))
-def hurst_regime(H): return "📈 TRENDING" if H>0.58 else ("🔄 REVERTING" if H<0.42 else "〰 CHOPPY")
+def hurst_score(H: float)  -> float: return float(np.clip((H - 0.5) * 200 + 50, 0, 100))
+def hurst_regime(H: float) -> str:
+    return "📈 TRENDING" if H > 0.58 else ("🔄 REVERTING" if H < 0.42 else "〰 CHOPPY")
 
-def compute_hawkes(df: pd.DataFrame) -> tuple[float, float]:
-    close=df["close"].values; high=df["high"].values
-    low=df["low"].values; vols=df["volume"].values; n=len(vols)
+
+def compute_hawkes(df: pd.DataFrame) -> tuple:
+    h, l, c, v = df["high"].values, df["low"].values, df["close"].values, df["volume"].values
+    n = len(v)
     if n < 20: return 0.0, 50.0
-    br = np.where(high-low>0, (close-low)/(high-low), 0.5)
-    bv = br*vols; sv = (1-br)*vols
-    bb = pd.Series(bv).rolling(20,min_periods=5).mean().values
-    bs = pd.Series(sv).rolling(20,min_periods=5).mean().values
-    mu = float(np.nanmean(bb[~np.isnan(bb)]))
-    if mu<=0: return 0.0, 50.0
-    alpha=mu*0.5; beta=HAWKES_DECAY
-    lams=np.zeros(n); lams[0]=mu
-    for t in range(1,n):
-        d=mu+(lams[t-1]-mu)*math.exp(-beta)
-        bbt=bb[t-1] if not np.isnan(bb[t-1]) else mu
-        bst=bs[t-1] if not np.isnan(bs[t-1]) else mu
-        delta=0.0
-        if bv[t-1]>bbt*1.8: delta+=alpha
-        if sv[t-1]>bst*1.8: delta-=alpha*0.8
-        lams[t]=max(0.0, d+delta)
-    cur=lams[-1]
-    base=np.nanmean(lams[max(0,n-30):-5]) if n>10 else mu
-    if base<=0: return cur, 50.0
-    ratio=cur/(base+1e-9)
-    score=float(np.clip(50+50*math.tanh(ratio-1.0),0,100))
-    return round(cur,4), round(score,1)
+    br   = np.where(h - l > 0, (c - l) / (h - l), 0.5)
+    bv, sv = br * v, (1 - br) * v
+    bb   = pd.Series(bv).rolling(20, min_periods=5).mean().values
+    bs   = pd.Series(sv).rolling(20, min_periods=5).mean().values
+    mu   = float(np.nanmean(bb[~np.isnan(bb)]))
+    if mu <= 0: return 0.0, 50.0
+    alpha, lams = mu * 0.5, np.zeros(n)
+    lams[0] = mu
+    for t in range(1, n):
+        decay = mu + (lams[t-1] - mu) * math.exp(-HAWKES_DECAY)
+        bbt   = bb[t-1] if not np.isnan(bb[t-1]) else mu
+        bst   = bs[t-1] if not np.isnan(bs[t-1]) else mu
+        delta = (alpha if bv[t-1] > bbt * 1.8 else 0.0) - (alpha * 0.8 if sv[t-1] > bst * 1.8 else 0.0)
+        lams[t] = max(0.0, decay + delta)
+    base  = np.nanmean(lams[max(0, n-30):-5]) if n > 10 else mu
+    if base <= 0: return lams[-1], 50.0
+    score = float(np.clip(50 + 50 * math.tanh(lams[-1] / (base + 1e-9) - 1.0), 0, 100))
+    return round(lams[-1], 4), round(score, 1)
 
-def hawkes_signal(s): return "🔥 CLUSTERING" if s>=72 else ("⚡ BUILDING" if s>=58 else ("〰 IDLE" if s>=42 else "❄ FADING"))
+def hawkes_signal(s: float) -> str:
+    return "🔥 CLUSTERING" if s>=72 else ("⚡ BUILDING" if s>=58 else ("〰 IDLE" if s>=42 else "❄ FADING"))
 
-def compute_ofi(df: pd.DataFrame, window: int = 12) -> tuple[float, float, float]:
-    close=df["close"].values; high=df["high"].values
-    low=df["low"].values; vol=df["volume"].values
-    br=np.where(high-low>0,(close-low)/(high-low),0.5)
-    bv=br*vol
-    br_=pd.Series(bv).rolling(window,min_periods=3).sum()
-    tr_=pd.Series(vol).rolling(window,min_periods=3).sum()
-    ofi_s=(br_/tr_.replace(0,np.nan)).fillna(0.5)
-    ofi=float(ofi_s.iloc[-1])
-    delta=float(ofi_s.iloc[-1]-ofi_s.iloc[-4]) if len(ofi_s)>=4 else 0.0
-    return round(ofi,4), round(delta,4), round(float(np.clip(ofi*100+delta*50,0,100)),1)
 
-def ofi_signal(ofi,delta):
-    if ofi>=0.65 and delta>=0: return "🟢 ACCUMULATING"
-    elif ofi>=0.60 and delta<0: return "🟡 TOPPING"
-    elif ofi<=0.35: return "🔴 DISTRIBUTING"
-    elif ofi<=0.42: return "🟠 SELLING"
+def compute_ofi(df: pd.DataFrame, window: int = 12) -> tuple:
+    h, l, c, v = df["high"].values, df["low"].values, df["close"].values, df["volume"].values
+    br   = np.where(h - l > 0, (c - l) / (h - l), 0.5)
+    ofi  = (pd.Series(br * v).rolling(window, min_periods=3).sum() /
+            pd.Series(v).rolling(window, min_periods=3).sum().replace(0, np.nan)).fillna(0.5)
+    cur  = float(ofi.iloc[-1])
+    delt = float(ofi.iloc[-1] - ofi.iloc[-4]) if len(ofi) >= 4 else 0.0
+    return round(cur, 4), round(delt, 4), round(float(np.clip(cur*100 + delt*50, 0, 100)), 1)
+
+def ofi_signal(ofi: float, delta: float) -> str:
+    if ofi >= 0.65 and delta >= 0: return "🟢 ACCUMULATING"
+    if ofi >= 0.60 and delta <  0: return "🟡 TOPPING"
+    if ofi <= 0.35:                return "🔴 DISTRIBUTING"
+    if ofi <= 0.42:                return "🟠 SELLING"
     return "⚪ NEUTRAL"
 
-def compute_atr(df: pd.DataFrame, n: int=14) -> float:
-    if df is None or len(df)<n: return 0.0
-    h=df["high"].values; l=df["low"].values; c=df["close"].values
-    trs=[max(h[-i]-l[-i], abs(h[-i]-c[-i-1]) if i<len(c) else 0,
-             abs(l[-i]-c[-i-1]) if i<len(c) else 0)
-         for i in range(1,min(n+1,len(c)))]
-    return round(float(np.mean(trs)),4) if trs else 0.0
+
+def compute_atr(df: pd.DataFrame, n: int = 14) -> float:
+    if df is None or len(df) < n: return 0.0
+    h, l, c = df["high"].values, df["low"].values, df["close"].values
+    trs = [max(h[-i] - l[-i],
+               abs(h[-i] - c[-i-1]) if i < len(c) else 0,
+               abs(l[-i] - c[-i-1]) if i < len(c) else 0)
+           for i in range(1, min(n+1, len(c)))]
+    return round(float(np.mean(trs)), 4) if trs else 0.0
+
 
 def calc_vwap(df: pd.DataFrame) -> float:
     try:
-        tz=df.index.tz
-        today=pd.Timestamp.now(tz=tz).strftime("%Y-%m-%d")
-        tb=df[df.index.strftime("%Y-%m-%d")==today]
-        if len(tb)<2: tb=df.tail(20)
-        tp=(tb["high"]+tb["low"]+tb["close"])/3
-        return round(float((tp*tb["volume"]).sum()/tb["volume"].sum()),4)
+        today = pd.Timestamp.now(tz=df.index.tz).strftime("%Y-%m-%d")
+        tb    = df[df.index.strftime("%Y-%m-%d") == today]
+        if len(tb) < 2: tb = df.tail(20)
+        tp = (tb["high"] + tb["low"] + tb["close"]) / 3
+        return round(float((tp * tb["volume"]).sum() / tb["volume"].sum()), 4)
     except Exception:
         return float(df["close"].iloc[-1])
 
-def intraday_health(df: pd.DataFrame, prior_close: float) -> tuple[float, str, dict]:
-    if df is None or len(df)<5: return 1.0, "NO DATA", {}
+
+def intraday_health(df: pd.DataFrame, prior_close: float) -> tuple:
+    if df is None or len(df) < 5: return 1.0, "NO DATA", {}
     try:
-        tz=df.index.tz; today=pd.Timestamp.now(tz=tz).strftime("%Y-%m-%d")
-        tb=df[df.index.strftime("%Y-%m-%d")==today]
+        today = pd.Timestamp.now(tz=df.index.tz).strftime("%Y-%m-%d")
+        tb    = df[df.index.strftime("%Y-%m-%d") == today]
     except Exception:
-        tb=df.tail(60)
-    if len(tb)<3: tb=df.tail(60)
-    today_open=float(tb["open"].iloc[0]); current=float(tb["close"].iloc[-1])
-    intra_r=(current-today_open)/today_open if today_open>0 else 0.0
-    gap_r=(today_open-prior_close)/prior_close if prior_close>0 else 0.0
-    recent=tb["close"].values[-LOWER_LOW_BARS:]
-    ll=int(sum(recent[i]<recent[i-1] for i in range(1,len(recent))))
-    making_ll=ll>=(LOWER_LOW_BARS-2)
-    tp=(tb["high"]+tb["low"]+tb["close"])/3
-    vwap=float((tp*tb["volume"]).cumsum().iloc[-1]/tb["volume"].cumsum().iloc[-1]) \
-         if tb["volume"].sum()>0 else current
-    below_vwap=current<vwap
-    mult=1.0; flags=[]
-    if gap_r<GAP_DOWN_THRESH: mult*=0.85; flags.append(f"GAP↓{gap_r*100:.1f}%")
-    if intra_r<=INTRADAY_KILL: mult=0.0; flags.append(f"SELLOFF{intra_r*100:.1f}%")
-    elif intra_r<=INTRADAY_HARD_WARN: mult*=0.50; flags.append(f"WEAK{intra_r*100:.1f}%")
-    elif intra_r<=INTRADAY_SOFT_WARN: mult*=0.75; flags.append(f"SOFT{intra_r*100:.1f}%")
-    else: flags.append(f"OK{intra_r*100:+.1f}%")
-    if making_ll: mult*=0.70; flags.append("LOWER-LOWS")
-    if below_vwap: mult*=0.80; flags.append(f"<VWAP${vwap:.2f}")
-    mult=float(np.clip(mult,0.0,1.0))
-    return mult," | ".join(flags) if flags else "HEALTHY",{
-        "intraday_ret":round(intra_r*100,2),"gap_ret":round(gap_r*100,2),
-        "today_open":round(today_open,2),"vwap":round(vwap,2),
-        "below_vwap":below_vwap,"lower_lows":ll,"health_mult":round(mult,3)}
+        tb = df.tail(60)
+    if len(tb) < 3: tb = df.tail(60)
+
+    open_p  = float(tb["open"].iloc[0])
+    curr    = float(tb["close"].iloc[-1])
+    intra_r = (curr - open_p) / open_p if open_p > 0 else 0.0
+    gap_r   = (open_p - prior_close) / prior_close if prior_close > 0 else 0.0
+    recent  = tb["close"].values[-LOWER_LOW_BARS:]
+    ll      = int(sum(recent[i] < recent[i-1] for i in range(1, len(recent))))
+    tp      = (tb["high"] + tb["low"] + tb["close"]) / 3
+    vwap    = float((tp * tb["volume"]).cumsum().iloc[-1] / tb["volume"].cumsum().iloc[-1]) \
+              if tb["volume"].sum() > 0 else curr
+
+    mult, flags = 1.0, []
+    if gap_r    < GAP_DOWN_THRESH: mult *= 0.85; flags.append(f"GAP↓{gap_r*100:.1f}%")
+    if intra_r <= INTRADAY_KILL:   mult  = 0.0;  flags.append(f"SELLOFF{intra_r*100:.1f}%")
+    elif intra_r <= INTRADAY_HARD: mult *= 0.50;  flags.append(f"WEAK{intra_r*100:.1f}%")
+    elif intra_r <= INTRADAY_SOFT: mult *= 0.75;  flags.append(f"SOFT{intra_r*100:.1f}%")
+    else:                                          flags.append(f"OK{intra_r*100:+.1f}%")
+    if ll >= LOWER_LOW_BARS - 2:   mult *= 0.70;  flags.append("LOWER-LOWS")
+    if curr < vwap:                mult *= 0.80;  flags.append(f"<VWAP${vwap:.2f}")
+
+    mult = float(np.clip(mult, 0.0, 1.0))
+    return mult, " | ".join(flags) or "HEALTHY", {
+        "intraday_ret":round(intra_r*100,2), "gap_ret":round(gap_r*100,2),
+        "today_open":round(open_p,2), "vwap":round(vwap,2),
+        "below_vwap":curr < vwap, "lower_lows":ll, "health_mult":round(mult,3)
+    }
+
 
 def get_market_regime() -> dict:
-    spy=fetch_closes("SPY",25); qqq=fetch_closes("QQQ",25)
-    def dev(arr):
-        if arr is None or len(arr)<20: return 0.0,0.0
-        sma=np.mean(arr[-20:])
-        return arr[-1],(arr[-1]-sma)/sma if sma>0 else 0.0
-    sp,sd=dev(spy); qp,qd=dev(qqq)
-    if sd>0.002 and qd>0.002: r="RISK-ON 📈"; al=True; mm=1.10
-    elif sd<SPY_WEAK_THRESH and qd<SPY_WEAK_THRESH: r="RISK-OFF 📉"; al=False; mm=0.40
-    else: r="NEUTRAL ➡"; al=True; mm=1.00
+    def dev(sym):
+        arr = fetch_closes(sym, 25)
+        if arr is None or len(arr) < 20: return 0.0, 0.0
+        sma = np.mean(arr[-20:])
+        return arr[-1], (arr[-1] - sma) / sma if sma > 0 else 0.0
+    sp, sd = dev("SPY"); qp, qd = dev("QQQ")
+    if sd > 0.002 and qd > 0.002:                       r, al, mm = "RISK-ON 📈",  True,  1.10
+    elif sd < SPY_WEAK_THRESH and qd < SPY_WEAK_THRESH: r, al, mm = "RISK-OFF 📉", False, 0.40
+    else:                                                r, al, mm = "NEUTRAL ➡",  True,  1.00
     return {"regime":r,"allows_long":al,"mkt_mult":mm,
             "spy_price":round(sp,2),"spy_dev":round(sd*100,2),
             "qqq_price":round(qp,2),"qqq_dev":round(qd*100,2)}
 
-def get_sector_rs(etf: str) -> tuple[float, float, bool]:
-    ec=fetch_closes(etf,25); sc=fetch_closes("SPY",25)
-    if ec is None or sc is None or len(ec)<20 or len(sc)<20: return 1.0,50.0,True
-    er=ec[-1]/np.mean(ec[-20:]); sr=sc[-1]/np.mean(sc[-20:])
-    ratio=er/sr if sr>0 else 1.0
-    score=float(np.clip(50+(ratio-1.0)*500,0,100))
-    return round(ratio,4),round(score,1),ratio>=SECTOR_RS_MIN
 
-def kelly_size(price,atr,win_rate=0.60,rr=2.0):
-    if atr<=0 or price<=0: return 0.0,0.0,0
-    kf=max(0.0,(win_rate-(1-win_rate)/rr)*0.5); kf=min(kf,0.10)
-    drisk=ACCOUNT_SIZE*kf; stop=atr*ATR_STOP_MULT
-    sh=int(drisk/stop) if stop>0 else 0
-    return round(kf,4),round(drisk,2),min(sh,int(ACCOUNT_SIZE*0.20/price))
+def get_sector_rs(etf: str) -> tuple:
+    ec, sc = fetch_closes(etf, 25), fetch_closes("SPY", 25)
+    if ec is None or sc is None or len(ec) < 20 or len(sc) < 20: return 1.0, 50.0, True
+    ratio = (ec[-1] / np.mean(ec[-20:])) / (sc[-1] / np.mean(sc[-20:]))
+    return round(ratio, 4), round(float(np.clip(50+(ratio-1.0)*500,0,100)),1), ratio >= SECTOR_RS_MIN
 
 
-# ============================================================
-#  SIGNAL POSITIONS + HALF-LIFE STATE
-# ============================================================
+def kelly_size(price: float, atr: float, win_rate: float = 0.60, rr: float = 2.0) -> tuple:
+    if atr <= 0 or price <= 0: return 0.0, 0.0, 0
+    kf     = float(np.clip((win_rate - (1 - win_rate) / rr) * 0.5, 0.0, 0.10))
+    drisk  = ACCOUNT_SIZE * kf
+    shares = int(drisk / (atr * ATR_STOP_MULT)) if atr * ATR_STOP_MULT > 0 else 0
+    return round(kf, 4), round(drisk, 2), min(shares, int(ACCOUNT_SIZE * 0.20 / price))
+
+
+# ── Position & Trade Log ──────────────────────────────────────────────────────
 
 @dataclass
 class Position:
@@ -700,402 +471,512 @@ class Position:
     pnl:         float = 0.0
     shares:      int   = 0
 
-POSITIONS: dict[str, Position] = {}
-TRADE_LOG: list[dict] = []
+POSITIONS: dict = {}
+TRADE_LOG: list = []
 
 def update_trailing_stop(pos: Position, price: float) -> Position:
-    if pos.direction=="LONG":
-        pos.highest=max(pos.highest,price)
-        pos.stop=max(pos.stop, round(pos.highest-pos.atr*ATR_STOP_MULT,2))
-        pos.pnl=round((price-pos.entry_price)*pos.shares,2)
-    elif pos.direction=="SHORT":
-        pos.lowest=min(pos.lowest,price)
-        pos.stop=min(pos.stop, round(pos.lowest+pos.atr*ATR_STOP_MULT,2))
-        pos.pnl=round((pos.entry_price-price)*pos.shares,2)
+    if pos.direction == "LONG":
+        pos.highest = max(pos.highest, price)
+        pos.stop    = max(pos.stop, round(pos.highest - pos.atr * ATR_STOP_MULT, 2))
+        pos.pnl     = round((price - pos.entry_price) * pos.shares, 2)
+    elif pos.direction == "SHORT":
+        pos.lowest  = min(pos.lowest, price)
+        pos.stop    = min(pos.stop, round(pos.lowest + pos.atr * ATR_STOP_MULT, 2))
+        pos.pnl     = round((pos.entry_price - price) * pos.shares, 2)
     return pos
 
 def close_position(symbol: str, exit_price: float, reason: str):
-    pos=POSITIONS.get(symbol)
-    if pos and pos.direction!="FLAT":
-        pnl=((exit_price-pos.entry_price) if pos.direction=="LONG"
-             else (pos.entry_price-exit_price))*pos.shares
+    pos = POSITIONS.get(symbol)
+    if pos and pos.direction != "FLAT":
+        pnl = ((exit_price - pos.entry_price) if pos.direction == "LONG"
+               else (pos.entry_price - exit_price)) * pos.shares
         TRADE_LOG.append({"Symbol":symbol,"Direction":pos.direction,
             "Entry $":pos.entry_price,"Exit $":round(exit_price,2),
             "Shares":pos.shares,"P&L $":round(pnl,2),
             "Result":"WIN ✅" if pnl>0 else "LOSS ❌",
             "Reason":reason,"Time":datetime.now().strftime("%H:%M:%S")})
-    POSITIONS[symbol]=Position(symbol)
+    POSITIONS[symbol] = Position(symbol)
 
 
-# ============================================================
-#  MASTER SCAN FUNCTION
-#  Runs all 10 layers for one symbol.
-# ============================================================
+# ── Master Scan ───────────────────────────────────────────────────────────────
 
 def scan_symbol(symbol: str, market: dict, timeframe: str = "5m") -> Optional[dict]:
-    # ── Mid-cap gate ─────────────────────────────────────────
     passes, mcap_b = is_midcap(symbol)
     if not passes: return None
 
-    df_daily = fetch_daily(symbol, 60)
-    if df_daily is None or len(df_daily)<30: return None
+    df_d = fetch_daily(symbol, 60)
+    if df_d is None or len(df_d) < 30: return None
 
-    df_intra = fetch_intraday(symbol, timeframe)
-    if df_intra is None or len(df_intra)<15:
-        df_intra = df_daily.copy()
+    df_i = fetch_intraday(symbol, timeframe) or df_d.copy()
+    if len(df_i) < 15: df_i = df_d.copy()
 
-    price       = float(df_daily["close"].iloc[-1])
-    prior_close = float(df_daily["close"].iloc[-2]) if len(df_daily)>=2 else price
-    closes      = df_daily["close"].values
+    price       = float(df_d["close"].iloc[-1])
+    prior_close = float(df_d["close"].iloc[-2]) if len(df_d) >= 2 else price
+    closes      = df_d["close"].values
 
-    # ── Core indicators ──────────────────────────────────────
-    H=compute_hurst(closes); h_sc=hurst_score(H); h_reg=hurst_regime(H)
-    cur_lam,hawk_sc=compute_hawkes(df_intra); hawk_sig=hawkes_signal(hawk_sc)
-    cur_ofi,ofi_d,o_sc=compute_ofi(df_intra); o_sig=ofi_signal(cur_ofi,ofi_d)
-    etf=SECTOR_MAP.get(symbol,"SPY"); sec_rs,sec_sc,sec_gate=get_sector_rs(etf)
-    atr=compute_atr(df_daily)
+    H              = compute_hurst(closes)
+    h_sc           = hurst_score(H)
+    lam, hawk_sc   = compute_hawkes(df_i)
+    ofi, od, o_sc  = compute_ofi(df_i)
+    etf            = SECTOR_MAP.get(symbol, "SPY")
+    sec_rs, sec_sc, sec_gate = get_sector_rs(etf)
+    atr            = compute_atr(df_d)
+    add_val, add_b = get_add_breadth()
+    z              = compute_zscore(closes)
+    direction_g    = "LONG" if ofi >= 0.5 else "SHORT"
+    kurt, skew     = compute_kurtosis_skew(closes)
+    ks_sc, ks_lbl  = kurtosis_skew_score(kurt, skew, direction_g)
+    z_ok, _        = zscore_gate(z, direction_g)
+    bayes_p, b_log = bayesian_win_prob(add_b, sec_gate, hawk_sc, z_ok, ks_sc)
+    hlth, hlbl, hd = intraday_health(df_i, prior_close)
 
-    # ── NEW 1: ADD breadth ───────────────────────────────────
-    add_val,add_bull=get_add_breadth()
-    add_sc=add_score(add_bull)
-
-    # ── NEW 2: Z-Score ───────────────────────────────────────
-    z=compute_zscore(closes)
-    z_sc=zscore_score(z)
-
-    # ── NEW 3: Kurtosis & Skewness ───────────────────────────
-    kurt,skew=compute_kurtosis_skew(closes)
-    direction_guess="LONG" if cur_ofi>=0.5 else "SHORT"
-    ks_sc,ks_label=kurtosis_skew_score(kurt,skew,direction_guess)
-
-    # ── NEW 4: Bayesian probability ──────────────────────────
-    z_ok_long  = z <= ZSCORE_MAX
-    bayes_p,bayes_factors=bayesian_win_prob(
-        add_bull,sec_gate,hawk_sc,z_ok_long,ks_sc)
-
-    # ── Composite score (all 10 layers) ──────────────────────
-    W = {"hurst":0.12,"hawkes":0.20,"ofi":0.18,"sector":0.10,
-         "add":0.12,"zscore":0.10,"kurtskew":0.08,"bayes":0.10}
     raw = float(np.clip(
-        W["hurst"]*h_sc + W["hawkes"]*hawk_sc + W["ofi"]*o_sc +
-        W["sector"]*sec_sc + W["add"]*add_sc + W["zscore"]*z_sc +
-        W["kurtskew"]*ks_sc + W["bayes"]*bayes_p*100,
-        0,100))
+        0.12*h_sc + 0.20*hawk_sc + 0.18*o_sc + 0.10*sec_sc +
+        0.12*add_score(add_b) + 0.10*zscore_score(z) + 0.08*ks_sc + 0.10*bayes_p*100,
+        0, 100))
+    comp  = round(float(np.clip(raw * market["mkt_mult"] *
+                                (1.0 if sec_gate else 0.70) *
+                                (1.0 if add_b else 0.80) * hlth, 0, 100)), 1)
+    alert = comp >= SIGNAL_THRESHOLD and market["allows_long"] and hlth > 0.0 and z_ok
+    if not z_ok: comp = min(comp, 55.0)
 
-    sec_mult   = 1.0 if sec_gate else 0.70
-    add_mult   = 1.0 if add_bull else 0.80
-    health_mult,health_label,health_detail=intraday_health(df_intra,prior_close)
-    comp=round(float(np.clip(raw*market["mkt_mult"]*sec_mult*add_mult*health_mult,0,100)),1)
-    alert=comp>=SIGNAL_THRESHOLD and market["allows_long"] and health_mult>0.0
-
-    # Z-Score exhaustion hard block
-    z_long_ok,z_reason=zscore_gate(z,"LONG")
-    if not z_long_ok and direction_guess=="LONG":
-        alert=False; comp=min(comp,55.0)
-
-    # ── NEW 5: Alpha half-life ───────────────────────────────
-    strength,hl_remaining,hl_alive=halflife_remaining(symbol,comp,price,atr)
-
-    # ── Kelly ────────────────────────────────────────────────
-    kf,drisk,shares=kelly_size(price,atr,win_rate=bayes_p) if alert else (0.0,0.0,0)
-    stop_price=round(price-atr*ATR_STOP_MULT,2) if atr>0 else 0.0
-    target=round(price+atr*ATR_TARGET_MULT,2) if atr>0 else 0.0
-
-    # R:R check (NEW from to-do list — must be >2.0)
-    rr_ratio=((target-price)/atr) if atr>0 else 0.0
-    rr_ok=rr_ratio>=2.0
+    strength, hl_rem, hl_alive = halflife_remaining(symbol, comp, price, atr)
+    kf, drisk, shares = kelly_size(price, atr, win_rate=bayes_p) if alert else (0.0, 0.0, 0)
+    stop_p   = round(price - atr * ATR_STOP_MULT,  2) if atr > 0 else 0.0
+    target   = round(price + atr * ATR_TARGET_MULT, 2) if atr > 0 else 0.0
+    rr       = (target - price) / atr if atr > 0 else 0.0
 
     return {
         "symbol":symbol,"price":round(price,2),"score":comp,"alert":alert,
-        "hurst_H":round(H,3),"hurst_score":round(h_sc,1),"hurst_regime":h_reg,
-        "hawkes_lam":cur_lam,"hawkes_score":hawk_sc,"hawkes_sig":hawk_sig,
-        "ofi":cur_ofi,"ofi_delta":ofi_d,"ofi_score":o_sc,"ofi_sig":o_sig,
+        "hurst_H":round(H,3),"hurst_score":round(h_sc,1),"hurst_regime":hurst_regime(H),
+        "hawkes_lam":lam,"hawkes_score":hawk_sc,"hawkes_sig":hawkes_signal(hawk_sc),
+        "ofi":ofi,"ofi_delta":od,"ofi_score":o_sc,"ofi_sig":ofi_signal(ofi,od),
         "market":market["regime"],"sector_etf":etf,
         "sector_rs":sec_rs,"sector_score":sec_sc,"sector_gate":sec_gate,
-        # NEW fields
-        "add_val":add_val,"add_bull":add_bull,"add_score":round(add_sc,1),
-        "zscore":round(z,3),"zscore_score":round(z_sc,1),"zscore_ok":z_long_ok,
-        "kurtosis":kurt,"skewness":skew,"ks_score":ks_sc,"ks_label":ks_label,
-        "bayes_prob":round(bayes_p*100,1),"bayes_factors":bayes_factors,
-        "hl_strength":strength,"hl_remaining":round(hl_remaining,0),"hl_alive":hl_alive,
-        "rr_ratio":round(rr_ratio,2),"rr_ok":rr_ok,
+        "add_val":add_val,"add_bull":add_b,"add_score":round(add_score(add_b),1),
+        "zscore":round(z,3),"zscore_score":round(zscore_score(z),1),"zscore_ok":z_ok,
+        "kurtosis":kurt,"skewness":skew,"ks_score":ks_sc,"ks_label":ks_lbl,
+        "bayes_prob":round(bayes_p*100,1),"bayes_factors":b_log,
+        "hl_strength":strength,"hl_remaining":round(hl_rem,0),"hl_alive":hl_alive,
+        "rr_ratio":round(rr,2),"rr_ok":rr >= 2.0,
         "kelly_frac":kf,"dollar_risk":drisk,"shares":shares,
-        "atr":atr,"stop":stop_price,"target":target,
-        "health_mult":health_mult,"health_label":health_label,
-        "intraday_ret":health_detail.get("intraday_ret",0.0),
-        "gap_ret":health_detail.get("gap_ret",0.0),
-        "vwap":health_detail.get("vwap",0.0),
-        "below_vwap":health_detail.get("below_vwap",False),
+        "atr":atr,"stop":stop_p,"target":target,
+        "health_mult":hlth,"health_label":hlbl,
+        "intraday_ret":hd.get("intraday_ret",0.0),"gap_ret":hd.get("gap_ret",0.0),
+        "vwap":hd.get("vwap",0.0),"below_vwap":hd.get("below_vwap",False),
         "mcap_b":mcap_b,"scanned_at":datetime.now().strftime("%H:%M:%S"),
     }
 
-def run_full_scan(symbols=WATCHLIST, timeframe="5m") -> tuple[pd.DataFrame, dict]:
-    market=get_market_regime(); results=[]; blocked=[]
+
+def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
+    market   = get_market_regime()
+    results, blocked = [], []
     for sym in symbols:
         try:
-            p,mb=is_midcap(sym)
-            if not p: blocked.append(f"{sym}(${mb:.1f}B)"); continue
-            r=scan_symbol(sym,market,timeframe)
+            ok, mb = is_midcap(sym)
+            if not ok: blocked.append(f"{sym}(${mb:.1f}B)"); continue
+            r = scan_symbol(sym, market, timeframe)
             if r: results.append(r)
         except Exception as e:
             print(f"[ERR] {sym}: {e}")
-    market["blocked"]=blocked; market["blocked_count"]=len(blocked)
-    market["scanned"]=len(results)
+    market.update({"blocked":blocked,"blocked_count":len(blocked),"scanned":len(results)})
     if not results: return pd.DataFrame(), market
-    return pd.DataFrame(results).sort_values("score",ascending=False).reset_index(drop=True), market
+    return pd.DataFrame(results).sort_values(by=["score","bayes_prob"],
+                                              ascending=False).reset_index(drop=True), market
 
 
-# ============================================================
-#  STREAMLIT DASHBOARD
-# ============================================================
+# ── Universe Scanner ──────────────────────────────────────────────────────────
+
+def universe_prefilter(symbols: list) -> list:
+    survivors = []
+    for sym in symbols:
+        try:
+            df = yf.Ticker(sym).history(period="1mo", interval="1d")
+            if df.empty or len(df) < 10: continue
+            df.columns = [c.lower() for c in df.columns]
+            p = float(df["close"].iloc[-1])
+            if p < 5: continue
+            if float(df["volume"].mean()) < 300_000: continue
+            if float(df["close"].diff().abs().mean() / p) < 0.02: continue
+            ok, _ = is_midcap(sym)
+            if ok: survivors.append(sym)
+        except Exception:
+            continue
+    print(f"[UNIVERSE] {len(symbols)} → {len(survivors)} survivors")
+    return survivors
+
+
+def run_universe_scan(top_n: int = 30, timeframe: str = "5m") -> pd.DataFrame:
+    print(f"[UNIVERSE] Start {datetime.now().strftime('%H:%M:%S')}")
+    survivors = universe_prefilter(UNIVERSE)
+    if not survivors: return pd.DataFrame()
+    market, results = get_market_regime(), []
+    for i, sym in enumerate(survivors):
+        try:
+            r = scan_symbol(sym, market, timeframe)
+            if r: results.append(r)
+            if (i+1) % 10 == 0: print(f"[UNIVERSE] {i+1}/{len(survivors)}")
+        except Exception as e:
+            print(f"[UNIVERSE ERR] {sym}: {e}")
+        time.sleep(0.3)
+    if not results: return pd.DataFrame()
+    df = pd.DataFrame(results).sort_values(by=["score","bayes_prob"],
+                                            ascending=False).reset_index(drop=True)
+    with open("auto_watchlist.txt", "w") as f:
+        f.write("\n".join(df.head(top_n)["symbol"].tolist()))
+    print(f"[UNIVERSE] Saved top {top_n} → auto_watchlist.txt")
+    export_excel(df, market)
+    return df
+
+
+# ── Excel Export ──────────────────────────────────────────────────────────────
+
+def export_excel(df: pd.DataFrame, market: dict):
+    try:
+        import openpyxl
+    except ImportError:
+        print("[EXPORT] pip install openpyxl"); return
+
+    fname = f"scan_{datetime.now().strftime('%Y-%m-%d_%H%M')}.xlsx"
+    fpath = os.path.join(os.path.expanduser("~"), "Downloads", fname)
+    top   = df[df["alert"] == True]
+    mkt_row = {**{k: market.get(k,"—") for k in
+                  ["regime","spy_price","spy_dev","qqq_price","qqq_dev","scanned","blocked_count"]},
+               "Date":datetime.now().strftime("%Y-%m-%d"),
+               "ADD Bullish":str(_add_cache.get("bullish","—")),
+               "Signals":len(top)}
+
+    with pd.ExcelWriter(fpath, engine="openpyxl") as w:
+        df.to_excel(w, sheet_name="Full Scan", index=False)
+        if not top.empty: top.to_excel(w, sheet_name="Top Picks", index=False)
+        pd.DataFrame([mkt_row]).to_excel(w, sheet_name="Market Context", index=False)
+
+    if STREAMLIT_MODE:
+        with open(fpath, "rb") as f:
+            st.download_button(f"⬇️ Download {fname}", f.read(), file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.session_state["last_export_time"] = datetime.now().strftime("%H:%M:%S")
+        st.success(f"✅ Saved → Downloads/{fname}")
+    else:
+        print(f"[EXPORT] {fpath}")
+
+
+# ── Scheduler & Background Threads ───────────────────────────────────────────
+
+def _scheduler_loop():
+    schedule.every().day.at("09:00").do(lambda: run_universe_scan(30, "5m"))
+    print("[SCHEDULER] Daily 9:00 AM scan scheduled")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+_started = False
+def _start_background():
+    global _started
+    if not _started:
+        threading.Thread(target=_update_add_loop, daemon=True, name="add").start()
+        threading.Thread(target=_scheduler_loop,  daemon=True, name="sched").start()
+        _started = True
+
+_start_background()
+
+
+# ── Dashboard CSS ─────────────────────────────────────────────────────────────
+
+DASH_CSS = """<style>
+*{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif!important;}
+html,body,[class*="css"]{background:#0a0a0a!important;color:#e8e0c8!important;}
+section[data-testid="stSidebar"]{background:#111008!important;border-right:2px solid #f5c400!important;}
+.stButton>button{background:#f5c400!important;color:#0a0a0a!important;font-weight:700!important;
+  border:none!important;border-radius:4px!important;letter-spacing:1px!important;font-size:13px!important;}
+.stButton>button:hover{background:#ffd700!important;}
+.stSelectbox label,.stSlider label,.stTextArea label,.stNumberInput label{color:#a09060!important;font-size:12px!important;}
+[data-testid="stMetricValue"]{color:#f5c400!important;font-weight:700!important;}
+[data-testid="stMetricDelta"]{color:#4a90d9!important;}
+hr{border-color:#1e1a08!important;}
+.hdr{font-size:28px;font-weight:800;letter-spacing:6px;color:#f5c400;text-transform:uppercase;
+     border-bottom:2px solid #f5c400;padding-bottom:8px;text-shadow:0 0 30px rgba(245,196,0,0.3);}
+.sub{font-size:11px;font-weight:500;color:#5a5030;letter-spacing:3px;text-transform:uppercase;}
+.sub2{font-size:10px;font-weight:600;color:#5a5030;text-transform:uppercase;letter-spacing:2px;}
+.card{border-radius:4px;padding:16px;margin-bottom:10px;border:1px solid #1e1a08;background:#111008;}
+.card.on{border-color:#f5c400;background:#14120a;box-shadow:0 0 16px rgba(245,196,0,0.12);}
+.card.warn{border-color:#4a90d9;background:#0a0e14;}
+.sym{font-size:22px;font-weight:800;color:#ffffff;letter-spacing:2px;text-transform:uppercase;}
+.sc{font-size:30px;font-weight:900;line-height:1;}
+.bayes{font-size:20px;font-weight:700;line-height:1;}
+.tag{display:inline-block;font-size:10px;font-weight:700;padding:3px 8px;
+     border-radius:3px;margin:2px;letter-spacing:0.5px;text-transform:uppercase;}
+.row{display:flex;gap:6px;margin-top:8px;}
+.cell{flex:1;background:#0d0b06;border:1px solid #1e1a08;border-radius:3px;padding:5px 8px;}
+.lbl{font-size:9px;font-weight:700;color:#5a5030;text-transform:uppercase;letter-spacing:1.5px;}
+.val{font-size:12px;font-weight:600;color:#c8b870;}
+.bar-bg{background:#1e1a08;border-radius:2px;height:4px;margin:6px 0;overflow:hidden;}
+.bar-fg{height:4px;border-radius:2px;}
+.trade{background:#0d0b06;border:1px solid #2a2208;border-left:3px solid #f5c400;
+       border-radius:3px;padding:8px 12px;margin-top:8px;font-size:11px;
+       font-weight:500;color:#a09060;}
+</style>"""
+
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
 
 def run_dashboard():
-    st.set_page_config(page_title="QUANT v3",page_icon="⚡",
-                       layout="wide",initial_sidebar_state="expanded")
-
-    st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@500;700&display=swap');
-    html,body,[class*="css"]{background:#060a0d!important;color:#c8d8e8!important;}
-    .hdr{font-family:'Share Tech Mono',monospace;font-size:26px;letter-spacing:5px;
-         color:#00e5ff;text-shadow:0 0 20px rgba(0,229,255,0.5);}
-    .sub{font-family:'Share Tech Mono',monospace;font-size:11px;color:#3a6a82;letter-spacing:3px;}
-    .card{border-radius:8px;padding:16px;margin-bottom:10px;
-          border:1px solid #1a2e40;background:#0d1820;}
-    .card.on{border-color:#00ff8c;background:#081812;box-shadow:0 0 20px rgba(0,255,140,0.1);}
-    .card.warn{border-color:#ffb400;}
-    .sym{font-family:'Share Tech Mono',monospace;font-size:20px;color:#e8f4ff;letter-spacing:3px;}
-    .sc{font-family:'Share Tech Mono',monospace;font-size:28px;font-weight:700;}
-    .bayes{font-family:'Share Tech Mono',monospace;font-size:22px;font-weight:700;}
-    .tag{display:inline-block;font-family:'Share Tech Mono',monospace;font-size:10px;
-         padding:2px 7px;border-radius:3px;margin:2px;letter-spacing:1px;}
-    .row{display:flex;gap:8px;margin-top:8px;}
-    .cell{flex:1;background:#0a1520;border-radius:4px;padding:5px 8px;}
-    .lbl{font-family:'Share Tech Mono',monospace;font-size:9px;color:#2a4a62;
-         text-transform:uppercase;letter-spacing:1px;}
-    .val{font-family:'Share Tech Mono',monospace;font-size:12px;color:#a0c0d8;}
-    .bar-bg{background:#0a1520;border-radius:3px;height:5px;margin:6px 0;overflow:hidden;}
-    .bar-fg{height:5px;border-radius:3px;}
-    .trade{background:#0a1420;border:1px solid #1a3040;border-radius:5px;
-           padding:8px 12px;margin-top:8px;
-           font-family:'Share Tech Mono',monospace;font-size:11px;}
-    </style>
-    """, unsafe_allow_html=True)
+    st.set_page_config(page_title="QUANT v3", page_icon="⚡",
+                       layout="wide", initial_sidebar_state="expanded")
+    st.markdown(DASH_CSS, unsafe_allow_html=True)
 
     # ── Sidebar ──────────────────────────────────────────────
     with st.sidebar:
         st.header("🔍 v3 Controls")
-
-        timeframe = st.selectbox("Timeframe", ["15s","1m","5m","15m"],
-                                  index=2,
-                                  help="15s = simulated from 1m bars")
-
-        if os.path.exists("auto_watchlist.txt"):
-            with open("auto_watchlist.txt","r") as f: auto=f.read()
-        else:
-            auto="\n".join(WATCHLIST)
-        custom_syms = st.text_area("Watchlist (one per line)", value=auto, height=250)
-        run_btn = st.button("▶ RUN SCAN NOW", use_container_width=True)
-        refresh = st.slider("Auto-Refresh (sec)", 10, 300, 60)
-        acct    = st.number_input("Account Size ($)", value=int(ACCOUNT_SIZE),
-                                   step=5000, format="%d")
+        timeframe   = st.selectbox("Timeframe", ["15s","1m","5m","15m"], index=2)
+        auto_list   = open("auto_watchlist.txt").read() if os.path.exists("auto_watchlist.txt") \
+                      else "\n".join(WATCHLIST)
+        custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=250)
+        run_btn     = st.button("▶ RUN SCAN NOW",       use_container_width=True)
+        uni_btn     = st.button("🌍 RUN UNIVERSE SCAN", use_container_width=True)
+        refresh     = st.slider("Auto-Refresh (sec)", 10, 300, 60)
+        _           = st.number_input("Account Size ($)", value=int(ACCOUNT_SIZE), step=5000, format="%d")
         st.markdown("---")
-        st.markdown(f"""
-        <div style='font-family:Share Tech Mono;font-size:10px;color:#2a4a62'>
-        <b style='color:#00e5ff'>v3 ALL 10 LAYERS:</b><br>
-        ✓ Hurst regime<br>
-        ✓ Directional Hawkes λ<br>
-        ✓ OFI buy/sell pressure<br>
-        ✓ Sector RS gate<br>
-        ✓ ADD breadth proxy<br>
-        ✓ Z-Score exhaustion gate<br>
-        ✓ Kurtosis / Skewness filter<br>
-        ✓ Bayesian win probability<br>
-        ✓ Alpha half-life decay<br>
-        ✓ ATR trailing stop (3:1 R:R)<br><br>
-        <b style='color:#ffb400'>CAP: $300M–$20B</b><br>
-        <b style='color:#ffb400'>TF: {timeframe}</b><br>
-        Data: yfinance (Schwab ready)
-        </div>""", unsafe_allow_html=True)
+        st.markdown(f"<div style='font-size:10px;font-weight:600;color:#4a3a18'>"
+                    f"<span style='color:#f5c400'>10-LAYER ENGINE</span><br>"
+                    f"✓ Hurst · Hawkes · OFI<br>"
+                    f"✓ Sector RS · ADD Breadth<br>"
+                    f"✓ Z-Score · Kurt/Skew<br>"
+                    f"✓ Bayesian · Half-Life · ATR<br><br>"
+                    f"<span style='color:#4a90d9'>CAP: $300M–$20B</span><br>"
+                    f"<span style='color:#4a90d9'>TF: {timeframe}</span></div>",
+                    unsafe_allow_html=True)
 
-    symbols=[s.strip().upper() for s in custom_syms.split("\n") if s.strip()]
+    symbols = [s.strip().upper() for s in custom_syms.split("\n") if s.strip()]
 
-    for k,v in [("results",pd.DataFrame()),("market",{}),
-                ("last_scan",0.0),("count",0)]:
-        if k not in st.session_state: st.session_state[k]=v
+    # Session state
+    for k, v in [("results",pd.DataFrame()),("market",{}),
+                 ("last_scan",0.0),("count",0),("last_export_time","Never")]:
+        if k not in st.session_state: st.session_state[k] = v
 
-    now=time.time()
-    should=run_btn or (now-st.session_state["last_scan"]>refresh) or st.session_state["last_scan"]==0
-    if should:
-        with st.spinner(f"Scanning {len(symbols)} symbols on {timeframe}..."):
-            df,market=run_full_scan(symbols, timeframe)
+    now = time.time()
+
+    if uni_btn:
+        with st.spinner("Universe scan (~15 min)..."):
+            run_universe_scan(30, timeframe)
+        st.success("Done — watchlist updated")
+
+    if run_btn or (now - st.session_state["last_scan"] > refresh) or st.session_state["last_scan"] == 0:
+        with st.spinner(f"Scanning {len(symbols)} symbols..."):
+            df, market = run_full_scan(symbols, timeframe)
         st.session_state.update({"results":df,"market":market,
                                    "last_scan":now,"count":st.session_state["count"]+1})
 
-    df=st.session_state["results"]; market=st.session_state["market"]
-    count=st.session_state["count"]
+    df, market, count = st.session_state["results"], st.session_state["market"], st.session_state["count"]
 
-    # ── Header ───────────────────────────────────────────────
-    c1,c2=st.columns([3,1])
+    # ── Header ────────────────────────────────────────────────
+    c1, c2 = st.columns([3, 1])
+    add_val, add_bull = get_add_breadth()
     with c1:
-        st.markdown('<div class="hdr">⚡ QUANT SCANNER v3</div>',unsafe_allow_html=True)
-        st.markdown(f'<div class="sub">10-LAYER ENGINE · {timeframe.upper()} BARS · ALL FACTORS ACTIVE</div>',
-                    unsafe_allow_html=True)
+        st.markdown('<div class="hdr">▲ QUANT SCANNER v3</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sub">10-LAYER ENGINE · {timeframe.upper()} · CAP $300M–$20B</div>', unsafe_allow_html=True)
     with c2:
-        add_val,add_bull=get_add_breadth()
-        add_color="#00ff8c" if add_bull else "#ff4060"
-        st.markdown(
-            f'<div style="text-align:right;margin-top:6px">'
-            f'<div class="sub">{datetime.now().strftime("%H:%M:%S")} EST · #{count}</div>'
-            f'<div style="font-family:Share Tech Mono;font-size:12px;'
-            f'color:{add_color}">ADD {"▲ BULLISH" if add_bull else "▼ BEARISH"} '
-            f'({add_val:.3f})</div>'
-            f'<div class="sub">Next in {max(0,int(refresh-(now-st.session_state["last_scan"])))}s</div>'
-            f'</div>', unsafe_allow_html=True)
+        ac = "#f5c400" if add_bull else "#e05050"
+        st.markdown(f'<div style="text-align:right;margin-top:6px">'
+                    f'<div class="sub">{datetime.now().strftime("%H:%M:%S")} EST · SCAN #{count}</div>'
+                    f'<div style="font-size:12px;font-weight:700;color:{ac}">'
+                    f'ADD {"▲ BULLISH" if add_bull else "▼ BEARISH"} ({add_val:.3f})</div>'
+                    f'<div class="sub">NEXT REFRESH {max(0,int(refresh-(now-st.session_state["last_scan"])))}s</div>'
+                    f'</div>', unsafe_allow_html=True)
 
     if market:
-        rc="#00ff8c" if "RISK-ON" in market.get("regime","") else (
-           "#ff4060" if "RISK-OFF" in market.get("regime","") else "#ffb400")
-        bc=f" 🚫{market['blocked_count']} blocked" if market.get("blocked_count",0)>0 else ""
+        rc = "#f5c400" if "RISK-ON"  in market.get("regime","") else \
+             "#e05050" if "RISK-OFF" in market.get("regime","") else "#4a90d9"
         st.markdown(
-            f'<div style="font-family:Share Tech Mono;font-size:12px;'
-            f'color:#4a8aaa;letter-spacing:2px;margin-bottom:14px">'
+            f'<div style="font-size:12px;font-weight:600;color:#7a6a30;'
+            f'letter-spacing:2px;margin-bottom:14px;text-transform:uppercase;'
+            f'border-bottom:1px solid #1e1a08;padding-bottom:8px">'
             f'MARKET: <span style="color:{rc}">{market.get("regime","—")}</span>'
-            f' · SPY {market.get("spy_price","—")} ({market.get("spy_dev",0):+.2f}%)'
-            f' · QQQ {market.get("qqq_price","—")} ({market.get("qqq_dev",0):+.2f}%)'
-            f' · ✅{market.get("scanned",0)} scanned{bc}</div>',
-            unsafe_allow_html=True)
+            f'&nbsp;&nbsp;|&nbsp;&nbsp;SPY {market.get("spy_price","—")} '
+            f'<span style="color:{"#f5c400" if market.get("spy_dev",0)>0 else "#e05050"}">'
+            f'({market.get("spy_dev",0):+.2f}%)</span>'
+            f'&nbsp;&nbsp;|&nbsp;&nbsp;QQQ {market.get("qqq_price","—")} '
+            f'<span style="color:{"#f5c400" if market.get("qqq_dev",0)>0 else "#e05050"}">'
+            f'({market.get("qqq_dev",0):+.2f}%)</span>'
+            f'&nbsp;&nbsp;|&nbsp;&nbsp;✅ {market.get("scanned",0)} SCANNED'
+            f'{"&nbsp;&nbsp;🚫 "+str(market["blocked_count"])+" BLOCKED" if market.get("blocked_count",0)>0 else ""}'
+            f'</div>', unsafe_allow_html=True)
 
     if df.empty:
         st.info("No results — click ▶ RUN SCAN NOW")
         time.sleep(refresh); st.rerun(); return
 
-    alerts=df[df["alert"]==True]
+    # Alert banner
+    alerts = df[df["alert"] == True]
     if not alerts.empty:
-        syms="  ·  ".join(f"{r['symbol']} [{r['score']}] {r['bayes_prob']:.0f}%"
-                           for _,r in alerts.iterrows())
+        syms = "  ·  ".join(f"{r['symbol']} [{r['score']}] {r['bayes_prob']:.0f}%" for _,r in alerts.iterrows())
         st.markdown(
-            f'<div style="background:rgba(0,229,255,0.05);border:1px solid rgba(0,229,255,0.35);'
-            f'border-radius:6px;padding:10px 16px;margin-bottom:14px;'
-            f'font-family:Share Tech Mono;font-size:13px;color:#00e5ff;letter-spacing:2px">'
-            f'▶ SIGNAL  ·  {syms}</div>', unsafe_allow_html=True)
+            f'<div style="background:rgba(245,196,0,0.06);border:2px solid #f5c400;'
+            f'border-left:6px solid #f5c400;border-radius:4px;padding:12px 18px;'
+            f'margin-bottom:14px;font-size:13px;font-weight:700;color:#f5c400;'
+            f'letter-spacing:2px;text-transform:uppercase">▶ SIGNAL ALERT  ·  {syms}</div>',
+            unsafe_allow_html=True)
 
-    cols=st.columns(min(4,max(1,len(df))))
-    for i,(_,r) in enumerate(df.iterrows()):
-        sc=r["score"]
-        sc_col=("#00ff8c" if sc>=75 else "#00e5ff" if sc>=SIGNAL_THRESHOLD
-                else "#ffb400" if sc>=45 else "#ff4060")
-        css="on" if r["alert"] else ("warn" if sc>=55 else "")
-        bp=r["bayes_prob"]
-        bp_col="#00ff8c" if bp>=70 else "#ffb400" if bp>=55 else "#ff4060"
-        hl=r["hl_remaining"]; hl_str=f"⏱{int(hl)}s" if r["hl_alive"] else "—"
-        rr_str=f"{'✓' if r['rr_ok'] else '✗'} R:R {r['rr_ratio']:.1f}"
-
-        trade_html=""
-        if r["alert"]:
-            trade_html=f"""<div class="trade">
-            ENTRY ${r['price']} · STOP ${r['stop']} · TARGET ${r['target']}<br>
-            Kelly {r['kelly_frac']:.1%} → {r['shares']} shares · ${r['dollar_risk']} risk
-            </div>"""
-
-        with cols[i%len(cols)]:
+    # ── Signal Cards ──────────────────────────────────────────
+    cols = st.columns(min(4, max(1, len(df))))
+    for i, (_, r) in enumerate(df.iterrows()):
+        sc     = r["score"]
+        sc_col = "#f5c400" if sc>=75 else "#4a90d9" if sc>=SIGNAL_THRESHOLD else "#7a6a30" if sc>=45 else "#e05050"
+        bp     = r["bayes_prob"]
+        bp_col = "#f5c400" if bp>=70 else "#4a90d9" if bp>=55 else "#e05050"
+        css    = "on" if r["alert"] else ("warn" if sc>=55 else "")
+        hl_str = f"⏱ {int(r['hl_remaining'])}s" if r["hl_alive"] else "—"
+        trade  = (f'<div class="trade">ENTRY ${r["price"]} · STOP ${r["stop"]} · TARGET ${r["target"]}<br>'
+                  f'Kelly {r["kelly_frac"]:.1%} → {r["shares"]} shares · ${r["dollar_risk"]} risk</div>'
+                  if r["alert"] else "")
+        with cols[i % len(cols)]:
             st.markdown(f"""
             <div class="card {css}">
-              <div style="display:flex;justify-content:space-between">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start">
                 <div>
                   <div class="sym">{r['symbol']}</div>
-                  <div style="font-family:Share Tech Mono;font-size:11px;color:#4a7a92">
-                    ${r['price']} · MCap ${r.get('mcap_b',0):.1f}B
-                  </div>
+                  <div style="font-size:11px;font-weight:500;color:#6a5a28">${r['price']} &nbsp;·&nbsp; MCap ${r.get('mcap_b',0):.1f}B</div>
                 </div>
                 <div style="text-align:right">
                   <div class="sc" style="color:{sc_col}">{sc}</div>
                   <div class="bayes" style="color:{bp_col}">{bp:.0f}%</div>
-                  <div class="sub">BAYES WIN</div>
+                  <div class="sub2">BAYES WIN PROB</div>
                 </div>
               </div>
-              <div class="bar-bg">
-                <div class="bar-fg" style="width:{sc}%;background:{sc_col}"></div>
-              </div>
-              <div style="margin:4px 0">
-                <span class="tag" style="background:#0a1828;color:#4af;border:1px solid #1a3a52">{r['hurst_regime']}</span>
-                <span class="tag" style="background:#0a1828;color:#4af;border:1px solid #1a3a52">{r['hawkes_sig']}</span>
-                <span class="tag" style="background:#0a1828;color:#4af;border:1px solid #1a3a52">{r['ofi_sig']}</span>
-                <span class="tag" style="background:#0a1828;color:{'#0f8' if r['add_bull'] else '#f46'};border:1px solid #1a3a52">
-                  ADD {'▲' if r['add_bull'] else '▼'}
-                </span>
-                <span class="tag" style="background:#0a1828;color:{'#0f8' if r['zscore_ok'] else '#f46'};border:1px solid #1a3a52">
-                  Z={r['zscore']:.2f}
-                </span>
-                <span class="tag" style="background:#0a1828;color:#af8;border:1px solid #1a3a52">
-                  {r['ks_label']}
-                </span>
+              <div class="bar-bg"><div class="bar-fg" style="width:{sc}%;background:{sc_col}"></div></div>
+              <div style="margin:6px 0">
+                <span class="tag" style="background:#1a1600;color:#4a90d9;border:1px solid #2a2000">{r['hurst_regime']}</span>
+                <span class="tag" style="background:#1a1600;color:#4a90d9;border:1px solid #2a2000">{r['hawkes_sig']}</span>
+                <span class="tag" style="background:#1a1600;color:#4a90d9;border:1px solid #2a2000">{r['ofi_sig']}</span>
+                <span class="tag" style="background:#1a1600;color:{'#f5c400' if r['add_bull'] else '#e05050'};border:1px solid #2a2000">ADD {'▲' if r['add_bull'] else '▼'}</span>
+                <span class="tag" style="background:#1a1600;color:{'#f5c400' if r['zscore_ok'] else '#e05050'};border:1px solid #2a2000">Z={r['zscore']:.2f}</span>
+                <span class="tag" style="background:#1a1600;color:#c8b870;border:1px solid #2a2000">{r['ks_label']}</span>
               </div>
               <div class="row">
-                <div class="cell"><div class="lbl">HURST H</div><div class="val">{r['hurst_H']}</div></div>
+                <div class="cell"><div class="lbl">HURST</div><div class="val">{r['hurst_H']}</div></div>
                 <div class="cell"><div class="lbl">OFI</div><div class="val">{r['ofi']}</div></div>
                 <div class="cell"><div class="lbl">KURT</div><div class="val">{r['kurtosis']}</div></div>
                 <div class="cell"><div class="lbl">SKEW</div><div class="val">{r['skewness']}</div></div>
               </div>
               <div class="row">
                 <div class="cell"><div class="lbl">SECTOR</div>
-                  <div class="val" style="color:{'#0f8' if r['sector_gate'] else '#f46'}">{r['sector_etf']} {'✓' if r['sector_gate'] else '✗'}</div>
-                </div>
+                  <div class="val" style="color:{'#f5c400' if r['sector_gate'] else '#e05050'}">{r['sector_etf']} {'✓' if r['sector_gate'] else '✗'}</div></div>
                 <div class="cell"><div class="lbl">R:R</div>
-                  <div class="val" style="color:{'#0f8' if r['rr_ok'] else '#f46'}">{rr_str}</div>
-                </div>
+                  <div class="val" style="color:{'#f5c400' if r['rr_ok'] else '#e05050'}">{'✓' if r['rr_ok'] else '✗'} {r['rr_ratio']:.1f}:1</div></div>
                 <div class="cell"><div class="lbl">HALF-LIFE</div><div class="val">{hl_str}</div></div>
-                <div class="cell"><div class="lbl">HEALTH</div>
-                  <div class="val">{r['health_mult']:.2f}×</div>
-                </div>
+                <div class="cell"><div class="lbl">HEALTH</div><div class="val">{r['health_mult']:.2f}×</div></div>
               </div>
-              {trade_html}
+              {trade}
             </div>""", unsafe_allow_html=True)
 
-    # ── Trade log ────────────────────────────────────────────
+    # ── Trade Log ─────────────────────────────────────────────
     if TRADE_LOG:
         st.markdown("---")
         st.markdown("### 📋 Trade Log")
-        total=sum(t["P&L $"] for t in TRADE_LOG)
-        wins=sum(1 for t in TRADE_LOG if t["P&L $"]>0)
-        m1,m2,m3,m4=st.columns(4)
+        total = sum(t["P&L $"] for t in TRADE_LOG)
+        wins  = sum(1 for t in TRADE_LOG if t["P&L $"] > 0)
+        m1,m2,m3,m4 = st.columns(4)
         m1.metric("Total P&L", f"${total:+.2f}")
-        m2.metric("Win Rate", f"{wins/len(TRADE_LOG)*100:.0f}%")
-        m3.metric("Trades", len(TRADE_LOG))
-        m4.metric("Wins/Losses", f"{wins}/{len(TRADE_LOG)-wins}")
-        st.dataframe(pd.DataFrame(TRADE_LOG[::-1]),
-                     use_container_width=True, hide_index=True)
+        m2.metric("Win Rate",  f"{wins/len(TRADE_LOG)*100:.0f}%")
+        m3.metric("Trades",    len(TRADE_LOG))
+        m4.metric("W / L",     f"{wins} / {len(TRADE_LOG)-wins}")
+        st.dataframe(pd.DataFrame(TRADE_LOG[::-1]), use_container_width=True, hide_index=True)
 
+    # ── Top Alpha Pick (Execution Planner) ────────────────────
     st.markdown("---")
-    st.markdown("### 📊 Full Results Table")
-    show_cols=["symbol","score","bayes_prob","zscore","kurtosis","skewness",
-               "ks_label","hurst_regime","hawkes_sig","ofi_sig","sector_etf",
-               "add_bull","rr_ok","kelly_frac","shares","stop","target","health_label"]
-    st.dataframe(df[[c for c in show_cols if c in df.columns]],
-                 use_container_width=True, hide_index=True)
+    eligible = df[df["alert"] == True] if not df.empty else pd.DataFrame()
+    if not eligible.empty:
+        top = eligible.sort_values(by=["bayes_prob","score"], ascending=False).iloc[0]
+        sec_bull  = bool(top.get("sector_gate", True))
+        etf_name  = top.get("sector_etf","—")
+        above_vwap = not bool(top.get("below_vwap", False))
+        hl_rem    = int(top.get("hl_remaining", 600))
+        z_val     = float(top.get("zscore", 0))
+
+        st.markdown(f"## 🎯 Top Alpha Pick: **{top['symbol']}**")
+        if sec_bull: st.success(f"✅ Sector Alignment: {top['symbol']} in **{etf_name}** — outperforming SPY")
+        else:        st.warning(f"⚠️ Sector Divergence: **{etf_name}** lagging — reduce position size")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Bayesian Win Prob", f"{top['bayes_prob']:.1f}%",
+                      delta="High Conviction" if top['bayes_prob'] >= 65 else "Moderate")
+            st.write(f"**Stop:** ${top['stop']:.2f}  *(1.5× ATR ${top['atr']:.2f})*")
+            st.write(f"**Entry:** ${top['price']:.2f}  ·  **{int(top['shares'])} shares**  (${top['dollar_risk']:.0f} risk)")
+            st.caption(f"Kelly {top['kelly_frac']:.1%} of ${int(ACCOUNT_SIZE):,}")
+        with c2:
+            st.metric("Target", f"${top['target']:.2f}",
+                      delta=f"{top['rr_ratio']:.1f}:1 R:R {'✅' if top['rr_ok'] else '❌'}")
+            st.write(f"**Profit if hit:** ${(top['target']-top['price'])*top['shares']:.0f}")
+            if above_vwap: st.success("✅ Above VWAP — institutions net buyers")
+            else:          st.error("❌ Below VWAP — wait for reclaim")
+        with c3:
+            st.metric("Alpha Half-Life", f"{hl_rem}s",
+                      delta=f"{float(top.get('hl_strength',1.0))*100:.0f}% strength")
+            if z_val > 2.0:   st.error(f"Z={z_val:.2f} EXTENDED — reduce size")
+            elif z_val > 1.5: st.warning(f"Z={z_val:.2f} — Elevated")
+            else:             st.success(f"Z={z_val:.2f} ✅ — Healthy")
+            st.write(f"**{top.get('ks_label','—')}** (K:{top.get('kurtosis',0):.2f} S:{top.get('skewness',0):.2f})")
+
+        # 7-point checklist
+        checks = [
+            ("Market",    "RISK-OFF" not in market.get("regime",""), market.get("regime","—")),
+            ("Sector",    sec_bull,                                   etf_name),
+            ("ADD",       bool(top.get("add_bull",True)),             f"{top.get('add_val',0):.3f}"),
+            ("Z-Score",   bool(top.get("zscore_ok",True)),            f"Z={z_val:.2f}"),
+            ("R:R ≥ 2",   bool(top.get("rr_ok",False)),              f"{top.get('rr_ratio',0):.1f}:1"),
+            ("VWAP",      above_vwap,                                 f"${top.get('vwap',0):.2f}"),
+            ("Half-Life", bool(top.get("hl_alive",True)),             f"{hl_rem}s"),
+        ]
+        passed = sum(1 for _, ok, _ in checks if ok)
+        for col, (label, ok, detail) in zip(st.columns(len(checks)), checks):
+            with col:
+                st.markdown(
+                    f"<div style='text-align:center;font-size:11px;font-weight:700;"
+                    f"padding:8px 4px;border-radius:3px;"
+                    f"background:{'#1a1400' if ok else '#180808'};"
+                    f"border:1px solid {'#f5c400' if ok else '#e05050'}'>"
+                    f"{'✅' if ok else '❌'}&nbsp; {label}<br>"
+                    f"<span style='font-size:10px;font-weight:500;color:#6a5a28'>{detail}</span></div>",
+                    unsafe_allow_html=True)
+
+        verdict_color = "#f5c400" if passed >= 6 else "#4a90d9" if passed >= 4 else "#e05050"
+        verdict_text  = "▲ ALL CLEAR — EXECUTE"    if passed >= 6 else \
+                        "— PARTIAL — REDUCE SIZE"   if passed >= 4 else "✕ BLOCKED — DO NOT ENTER"
+        st.markdown(
+            f"<div style='text-align:center;font-size:16px;font-weight:800;"
+            f"color:{verdict_color};padding:14px;border-radius:4px;letter-spacing:3px;"
+            f"text-transform:uppercase;border:2px solid {verdict_color};"
+            f"background:{'rgba(245,196,0,0.06)' if passed>=6 else 'rgba(74,144,217,0.06)' if passed>=4 else 'rgba(224,80,80,0.06)'};"
+            f"margin-top:14px'>{verdict_text} &nbsp;·&nbsp; {passed}/{len(checks)} CHECKS PASSED</div>",
+            unsafe_allow_html=True)
+    else:
+        st.info("🎯 No execution-grade signals right now — watching and waiting.")
+
+    # ── Full Results Table ─────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📊 Full Scan Results")
+    show = ["symbol","score","bayes_prob","zscore","kurtosis","skewness","ks_label",
+            "hurst_regime","hawkes_sig","ofi_sig","sector_etf","add_bull",
+            "rr_ok","kelly_frac","shares","stop","target","health_label","mcap_b"]
+    st.dataframe(df[[c for c in show if c in df.columns]], use_container_width=True, hide_index=True)
+
+    # ── Export ─────────────────────────────────────────────────
+    st.markdown("---")
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        if st.button("📥 Export to Excel"): export_excel(df, market)
+    with ec2:
+        st.markdown(f"<div style='font-size:11px;font-weight:600;color:#6a5a28;"
+                    f"padding-top:8px;text-transform:uppercase;letter-spacing:1px'>"
+                    f"Last export: {st.session_state.get('last_export_time','Never')}</div>",
+                    unsafe_allow_html=True)
 
     time.sleep(refresh)
     st.rerun()
 
 
-# ============================================================
-#  BACKGROUND THREADS — start once
-# ============================================================
-
-_threads_started = False
-def _start_background():
-    global _threads_started
-    if not _threads_started:
-        threading.Thread(target=update_add_breadth_yf,
-                         daemon=True, name="add_breadth").start()
-        _threads_started = True
-
-_start_background()
-
-
-# ============================================================
-#  ENTRY POINT
-# ============================================================
+# ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("\n[QUANT v3] Run: python -m streamlit run scanner_v3.py\n")
