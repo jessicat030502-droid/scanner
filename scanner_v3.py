@@ -103,7 +103,7 @@ SIGNAL_THRESHOLD   = 65
 ATR_STOP_MULT      = 1.5
 ATR_TARGET_MULT    = 3.0             # Used in TREND mode only
 SPY_WEAK_THRESH    = -0.005
-SECTOR_RS_MIN      = 1.05            # Stricter: sector must lead SPY by 5%
+SECTOR_RS_MIN      = 1.01            # Sector must lead SPY by 1% (1.05 was too strict for normal markets)
 HAWKES_DECAY       = 0.3
 OFI_LONG_ENTRY     = 0.30            # Adaptive base (overridden by regime)
 OFI_SHORT_ENTRY    = -0.30
@@ -130,7 +130,7 @@ LOWER_LOW_BARS     = 6
 
 # ── Liquidity Firewall ────────────────────────────────────────
 MIN_DOLLAR_VOLUME  = 5_000_000       # $5M avg daily dollar volume
-MIN_REL_VOLUME     = 1.5             # Current volume must be 1.5x average
+MIN_REL_VOLUME     = 1.2             # Current volume must be 1.2x average (1.5 blocked off-peak scans)
 
 # ── Strategy Switch ───────────────────────────────────────────
 # TREND:         Hurst + Hawkes momentum — for trending/volatile markets
@@ -144,7 +144,7 @@ MR_STOP_LOSS_PCT   = 0.008           # 0.8% hard stop
 
 # ── ADX Regime ───────────────────────────────────────────────
 ADX_MAX            = 25              # Above this = strong trend = no mean reversion
-SPY_VOL_NOTRADE    = 0.015           # SPY move > 1.5% = no-trade zone
+SPY_VOL_NOTRADE    = 0.020           # SPY move > 2.0% = no-trade zone (1.5% was too tight)
 SPY_VOL_CALM       = 0.005           # < 0.5% = calm market
 SPY_VOL_NORMAL     = 0.010           # 0.5–1.0% = normal market
 
@@ -487,10 +487,11 @@ def intraday_health(df: pd.DataFrame, prior_close: float) -> tuple:
 
     mult, flags, hard_blocked = 1.0, [], False
 
-    # ── HARD BLOCKS — kill signal entirely ───────────────────
-    if below_vwap:
-        mult = 0.0; hard_blocked = True
-        flags.append(f"HARD:BELOW_VWAP${vwap:.2f}")
+    # ── HARD BLOCKS — only extreme conditions kill signal entirely ──
+    # NOTE: below_vwap is NO LONGER a hard block because:
+    #   - MR LONG entries REQUIRE price below VWAP (it's the setup condition)
+    #   - Hard blocking below_vwap was preventing every valid MR long from showing
+    # Instead: score penalty — the MR exhaustion gate enforces VWAP side correctly
 
     if intra_r <= INTRADAY_KILL:
         mult = 0.0; hard_blocked = True
@@ -499,6 +500,11 @@ def intraday_health(df: pd.DataFrame, prior_close: float) -> tuple:
     if gap_r < -0.02:
         mult = 0.0; hard_blocked = True
         flags.append(f"HARD:GAP↓{gap_r*100:.1f}%")
+
+    # VWAP position: soft penalty (not hard block)
+    if below_vwap and not hard_blocked:
+        mult *= 0.75
+        flags.append(f"BELOW_VWAP${vwap:.2f}")
 
     # ── SOFT PENALTIES — only if not already hard blocked ────
     if not hard_blocked:
@@ -895,7 +901,10 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
     # ── FIREWALL 5: Sector RS (updated to 1.05) ───────────────
     etf                      = SECTOR_MAP.get(symbol, "SPY")
     sec_rs, sec_sc, sec_gate = get_sector_rs(etf)
-    if not sec_gate: return None  # Hard block: sector must lead by 5%
+    # Sector RS: hard block only if completely failing (< 0.97 = sector badly lagging)
+    # Between 0.97–1.01: soft penalty applied in composite score — still scanned
+    if sec_rs < 0.97:
+        return None  # Sector is actively dragging — hard block
 
     # ── Core calculations (shared by both strategies) ─────────
     H_daily              = compute_hurst(closes)
@@ -1048,6 +1057,16 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         "intraday_ret":hd.get("intraday_ret",0.0),"gap_ret":hd.get("gap_ret",0.0),
         "below_vwap":hd.get("below_vwap",False),
         "mcap_b":mcap_b,"scanned_at":datetime.now().strftime("%H:%M:%S"),
+        # ── Golden Entry flag ─────────────────────────────────
+        # True when BOTH conditions align for ideal MR long setup:
+        #   Z-score <= -2.0  (price statistically oversold)
+        #   Price below VWAP (below institutional fair value)
+        # This is the exact rubber-band stretch the exhaustion engine targets.
+        "golden_entry": (
+            float(z) <= -Z_ENTRY_THRESH and
+            hd.get("below_vwap", False) and
+            strategy == "MEAN_REVERSION"
+        ),
     }
 
 
@@ -1238,33 +1257,63 @@ def run_universe_scan(top_n: int = 30, timeframe: str = "5m") -> pd.DataFrame:
 # ── Excel Export ──────────────────────────────────────────────────────────────
 
 def export_excel(df: pd.DataFrame, market: dict):
+    """
+    Writes two Excel files every time:
+      1. scan_YYYY-MM-DD_HHMM.xlsx  — timestamped snapshot (history preserved)
+      2. scan_latest.xlsx           — always overwritten (quick access to newest)
+    Both go to ~/Downloads.
+    Sheets: Full Scan · Top Picks (alerts only) · Market Context · Rejected Stocks
+    """
     try:
         import openpyxl
     except ImportError:
         print("[EXPORT] pip install openpyxl"); return
 
-    fname = f"scan_{datetime.now().strftime('%Y-%m-%d_%H%M')}.xlsx"
-    fpath = os.path.join(os.path.expanduser("~"), "Downloads", fname)
-    top   = df[df["alert"] == True]
+    dl_dir  = os.path.expanduser("~")
+    dl_dir  = os.path.join(dl_dir, "Downloads")
+    os.makedirs(dl_dir, exist_ok=True)
+
+    fname_ts     = f"scan_{datetime.now().strftime('%Y-%m-%d_%H%M')}.xlsx"
+    fname_latest = "scan_latest.xlsx"
+    fpath_ts     = os.path.join(dl_dir, fname_ts)
+    fpath_latest = os.path.join(dl_dir, fname_latest)
+
+    top     = df[df["alert"] == True] if not df.empty else pd.DataFrame()
+    rejected = pd.DataFrame(market.get("rejected_detail", []))
     mkt_row = {**{k: market.get(k,"—") for k in
                   ["regime","spy_price","spy_dev","qqq_price","qqq_dev","scanned","blocked_count"]},
-               "Date":datetime.now().strftime("%Y-%m-%d"),
+               "Date":       datetime.now().strftime("%Y-%m-%d"),
+               "Time":       datetime.now().strftime("%H:%M:%S"),
                "ADD Bullish":str(_add_cache.get("bullish","—")),
-               "Signals":len(top)}
+               "Strategy":   STRATEGY_MODE,
+               "Signals":    len(top)}
 
-    with pd.ExcelWriter(fpath, engine="openpyxl") as w:
-        df.to_excel(w, sheet_name="Full Scan", index=False)
-        if not top.empty: top.to_excel(w, sheet_name="Top Picks", index=False)
-        pd.DataFrame([mkt_row]).to_excel(w, sheet_name="Market Context", index=False)
+    def _write(path):
+        with pd.ExcelWriter(path, engine="openpyxl") as w:
+            if not df.empty:
+                df.to_excel(w, sheet_name="Full Scan", index=False)
+            if not top.empty:
+                top.to_excel(w, sheet_name="Top Picks", index=False)
+            pd.DataFrame([mkt_row]).to_excel(w, sheet_name="Market Context", index=False)
+            if not rejected.empty:
+                rejected.to_excel(w, sheet_name="Rejected Stocks", index=False)
+
+    # Write both files
+    _write(fpath_ts)
+    _write(fpath_latest)
 
     if STREAMLIT_MODE:
-        with open(fpath, "rb") as f:
-            st.download_button(f"⬇️ Download {fname}", f.read(), file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with open(fpath_ts, "rb") as f:
+            st.download_button(
+                f"⬇️ {fname_ts}", f.read(), file_name=fname_ts,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_{fname_ts}"
+            )
         st.session_state["last_export_time"] = datetime.now().strftime("%H:%M:%S")
-        st.success(f"✅ Saved → Downloads/{fname}")
+        st.session_state["last_export_path"] = fpath_ts
+        st.success(f"✅ Saved → {fname_ts}  +  scan_latest.xlsx")
     else:
-        print(f"[EXPORT] {fpath}")
+        print(f"[EXPORT] {fpath_ts} + scan_latest.xlsx")
 
 
 # ── Scheduler & Background Threads ───────────────────────────────────────────
@@ -1422,6 +1471,26 @@ def run_dashboard():
         st.session_state.update({"results":df,"market":market,
                                    "last_scan":now,"count":st.session_state["count"]+1})
 
+        # ── AUTO-EXPORT: save every scan automatically ────────
+        if not df.empty:
+            try:
+                # 1. Timestamped Excel snapshot (one file per scan)
+                export_excel(df, market)
+
+                # 2. Cumulative daily CSV log (appends all day — never overwrites)
+                log_path = os.path.join(
+                    os.path.expanduser("~"), "Downloads",
+                    f"scan_log_{datetime.now().strftime('%Y-%m-%d')}.csv"
+                )
+                df_log = df.copy()
+                df_log["scan_time"] = datetime.now().strftime("%H:%M:%S")
+                df_log["scan_num"]  = st.session_state["count"]
+                write_header = not os.path.exists(log_path)
+                df_log.to_csv(log_path, mode="a", header=write_header, index=False)
+                st.session_state["last_log_path"] = log_path
+            except Exception as e:
+                st.warning(f"⚠️ Auto-export failed: {e}")
+
     df, market, count = st.session_state["results"], st.session_state["market"], st.session_state["count"]
 
     # ── Header ────────────────────────────────────────────────
@@ -1485,6 +1554,32 @@ def run_dashboard():
             f'letter-spacing:2px;text-transform:uppercase">▶ SIGNAL ALERT  ·  {syms}</div>',
             unsafe_allow_html=True)
 
+    # ── Golden Entry Banner ───────────────────────────────────
+    # Surfaces the most important condition in the whole scanner:
+    # Z <= -2.0 + below VWAP in MEAN_REVERSION mode = highest-probability MR long setup
+    if "golden_entry" in df.columns:
+        golden = df[df["golden_entry"] == True]
+        if not golden.empty:
+            ge_syms = "  ·  ".join(
+                f"{r['symbol']} Z={r['zscore']:.2f} VWAP${r.get('vwap',0):.2f}"
+                for _, r in golden.iterrows()
+            )
+            st.markdown(
+                f'<div style="background:#fff8e1;border:2px solid #f5c400;'
+                f'border-left:8px solid #f5c400;border-radius:4px;'
+                f'padding:14px 18px;margin-bottom:14px;">'
+                f'<div style="font-size:13px;font-weight:800;color:#b08800;'
+                f'letter-spacing:2px;text-transform:uppercase;margin-bottom:4px">'
+                f'⭐ GOLDEN ENTRY SETUP — Z ≤ -2.0 + BELOW VWAP</div>'
+                f'<div style="font-size:12px;font-weight:600;color:#1a1a1a">'
+                f'{ge_syms}</div>'
+                f'<div style="font-size:10px;color:#888888;margin-top:4px">'
+                f'Price is statistically oversold AND below institutional fair value. '
+                f'Wait for OFI exhaustion confirmation before entering.</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
     # ── Signal Cards ──────────────────────────────────────────
     cols = st.columns(min(4, max(1, len(df))))
     for i, (_, r) in enumerate(df.iterrows()):
@@ -1547,14 +1642,16 @@ def run_dashboard():
                 <span class="tag" style="background:#f8f8f8;color:{'#1a8c2a' if r['zscore_ok'] else '#d94040'};border:1px solid #dddddd">Z={r['zscore']:.2f}</span>
                 <span class="tag" style="background:#fffdf0;color:#b08800;border:1px solid #f0e080">{r['ks_label']}</span>
                 {conflict_tag}{blocked_tag}
+                {"<span class=\"tag\" style=\"background:#fff8e1;color:#b08800;border:2px solid #f5c400;font-weight:800\">⭐ GOLDEN ENTRY</span>" if r.get("golden_entry") else ""}
               </div>
               <div class="row">
                 <div class="cell"><div class="lbl">HURST D</div><div class="val">{r['hurst_H']}</div></div>
                 <div class="cell"><div class="lbl">HURST 5M</div>
                   <div class="val" style="color:{'#1a8c2a' if h_intra>0.55 else '#d94040' if h_intra<0.42 else '#888888'}">{h_intra}</div></div>
                 <div class="cell"><div class="lbl">OFI</div><div class="val">{r['ofi']}</div></div>
-                <div class="cell"><div class="lbl">VWAP</div>
-                  <div class="val" style="color:{'#d94040' if r.get('below_vwap') else '#1a8c2a'}">${r.get('vwap',0):.2f}</div></div>
+                <div class="cell" style="{'background:#fff8e1;border:1px solid #f5c400' if r.get('golden_entry') else ''}">
+                  <div class="lbl">Z-SCORE{'  ⭐' if r.get('golden_entry') else ''}</div>
+                  <div class="val" style="color:{'#b08800' if r.get('golden_entry') else '#d94040' if float(r['zscore'])<=-2.0 else '#1a8c2a' if float(r['zscore'])>=2.0 else '#1a1a1a'};{'font-weight:800' if abs(float(r['zscore']))>=2.0 else ''}">{r['zscore']:.2f}</div></div>
               </div>
               <div class="row">
                 <div class="cell"><div class="lbl">SECTOR</div>
@@ -1562,7 +1659,9 @@ def run_dashboard():
                 <div class="cell"><div class="lbl">R:R</div>
                   <div class="val" style="color:{'#1a8c2a' if r['rr_ok'] else '#d94040'}">{'✓' if r['rr_ok'] else '✗'} {r['rr_ratio']:.1f}:1</div></div>
                 <div class="cell"><div class="lbl">HALF-LIFE</div><div class="val">{hl_str}</div></div>
-                <div class="cell"><div class="lbl">EXIT</div><div class="val" style="font-size:10px">{exit_t.replace('_',' ')}</div></div>
+                <div class="cell" style="{'background:#fff0f0' if r.get('below_vwap') else 'background:#f0fff4'}">
+                  <div class="lbl">VWAP</div>
+                  <div class="val" style="color:{'#d94040' if r.get('below_vwap') else '#1a8c2a'}">${r.get('vwap',0):.2f} {'↓' if r.get('below_vwap') else '↑'}</div></div>
               </div>
               {trade_html}
             </div>""", unsafe_allow_html=True)
@@ -1654,10 +1753,67 @@ def run_dashboard():
     # ── Full Results Table ─────────────────────────────────────
     st.markdown("---")
     st.markdown("### 📊 Full Scan Results")
-    show = ["symbol","score","bayes_prob","strategy","adx","zscore","kurtosis","skewness",
-            "ks_label","hurst_regime","hawkes_sig","ofi_sig","sector_etf","add_bull",
-            "rr_ok","kelly_frac","shares","stop","target","vwap","health_label","mcap_b"]
-    st.dataframe(df[[c for c in show if c in df.columns]], use_container_width=True, hide_index=True)
+
+    if not df.empty:
+        # Build display DataFrame
+        show_cols = ["symbol","golden_entry","score","strategy","bayes_prob",
+                     "zscore","vwap","below_vwap","adx",
+                     "kurtosis","skewness","ks_label",
+                     "hurst_regime","hawkes_sig","ofi_sig","sector_etf",
+                     "add_bull","rr_ok","kelly_frac","shares",
+                     "stop","target","health_label","mcap_b"]
+        df_show = df[[c for c in show_cols if c in df.columns]].copy()
+
+        # Sort: golden entries first, then by score descending
+        if "golden_entry" in df_show.columns:
+            df_show = df_show.sort_values(
+                by=["golden_entry","score","bayes_prob"],
+                ascending=[False, False, False]
+            ).reset_index(drop=True)
+
+        # Rename for readability
+        df_show = df_show.rename(columns={
+            "golden_entry":  "⭐ Golden",
+            "bayes_prob":    "Bayes%",
+            "below_vwap":    "< VWAP",
+            "sector_etf":    "Sector",
+            "add_bull":      "ADD ▲",
+            "rr_ok":         "R:R ✓",
+            "kelly_frac":    "Kelly%",
+            "health_label":  "Health",
+            "mcap_b":        "MCap $B",
+        })
+
+        # Streamlit styling — highlight golden rows yellow, z-score column red/green
+        def highlight_golden(row):
+            if row.get("⭐ Golden", False):
+                return ["background-color:#fff8e1;font-weight:700"] * len(row)
+            return [""] * len(row)
+
+        def color_zscore(val):
+            try:
+                v = float(val)
+                if v <= -2.0:  return "color:#d94040;font-weight:800"
+                if v >= 2.0:   return "color:#1a8c2a;font-weight:800"
+            except (ValueError, TypeError):
+                pass
+            return ""
+
+        styled = (df_show.style
+                  .apply(highlight_golden, axis=1)
+                  .applymap(color_zscore, subset=["zscore"] if "zscore" in df_show.columns else []))
+
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        # Golden Entry legend
+        st.markdown(
+            "<div style='font-size:11px;color:#888888;padding:4px 0'>"
+            "⭐ <b>Golden Entry</b> = Z-Score ≤ -2.0 AND price below VWAP AND strategy = MEAN REVERSION  "
+            "· <span style='color:#d94040;font-weight:700'>Red Z-Score</span> = oversold (long setup)  "
+            "· <span style='color:#1a8c2a;font-weight:700'>Green Z-Score</span> = overbought (short setup)"
+            "</div>",
+            unsafe_allow_html=True
+        )
 
     # ── Rejected / Blocked Stocks ──────────────────────────────
     st.markdown("---")
@@ -1716,17 +1872,32 @@ def run_dashboard():
     else:
         st.info("No rejections recorded — run a scan first.")
 
-    # ── Export (Excel + CSV) ───────────────────────────────────
+    # ── Export (Excel + CSV + Daily Log) ──────────────────────
     st.markdown("---")
     st.markdown("### 📥 Export")
-    ec1, ec2, ec3 = st.columns(3)
+
+    # Auto-export status banner
+    last_export = st.session_state.get('last_export_time', 'Never')
+    last_log    = st.session_state.get('last_log_path', None)
+    st.markdown(
+        f"<div style='background:#f0f7ff;border:1px solid #1a5fd9;border-left:4px solid #1a5fd9;"
+        f"border-radius:4px;padding:10px 14px;margin-bottom:12px;font-size:11px;"
+        f"font-weight:600;color:#1a1a1a'>"
+        f"🔄 AUTO-EXPORT ACTIVE — every scan saves to ~/Downloads automatically<br>"
+        f"<span style='color:#666666;font-weight:400'>"
+        f"Excel snapshot per scan · Daily CSV log appends all day · "
+        f"Last export: {last_export}</span></div>",
+        unsafe_allow_html=True
+    )
+
+    ec1, ec2, ec3, ec4 = st.columns(4)
 
     with ec1:
-        if st.button("📊 Export to Excel"):
+        if st.button("📊 Export to Excel Now", use_container_width=True):
             export_excel(df, market)
 
     with ec2:
-        # CSV export — always available, no file system needed
+        # Instant CSV download of current scan
         csv_data = df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="📄 Download CSV",
@@ -1737,21 +1908,34 @@ def run_dashboard():
         )
 
     with ec3:
-        # Rejected stocks as CSV
+        # Download the cumulative daily log if it exists
+        if last_log and os.path.exists(last_log):
+            with open(last_log, "rb") as f:
+                st.download_button(
+                    label="📋 Download Daily Log",
+                    data=f.read(),
+                    file_name=os.path.basename(last_log),
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+        else:
+            st.markdown(
+                "<div style='font-size:11px;color:#888888;padding-top:8px'>"
+                "Daily log available after first scan</div>",
+                unsafe_allow_html=True)
+
+    with ec4:
+        # Rejected stocks CSV
+        rejected_detail = market.get("rejected_detail", [])
         if rejected_detail:
             rej_csv = pd.DataFrame(rejected_detail).to_csv(index=False).encode("utf-8")
             st.download_button(
-                label="🚫 Download Rejections CSV",
+                label="🚫 Download Rejections",
                 data=rej_csv,
                 file_name=f"rejected_{datetime.now().strftime('%Y-%m-%d_%H%M')}.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
-        st.markdown(
-            f"<div style='font-size:11px;font-weight:600;color:#888888;"
-            f"padding-top:8px;text-transform:uppercase;letter-spacing:1px'>"
-            f"Last Excel: {st.session_state.get('last_export_time','Never')}</div>",
-            unsafe_allow_html=True)
 
     time.sleep(refresh)
     st.rerun()
