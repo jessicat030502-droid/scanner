@@ -95,23 +95,29 @@ UNIVERSE = list(dict.fromkeys([
     "OBNK","OCFC","OCGN","OCSL","OCUL","OFG","OGS","OMCL","OPCH","OPRT",
 ]))
 
+# ── Universe Mode ────────────────────────────────────────────
+# WATCHLIST:   40-stock curated list   — fast, manual picks
+# RUSSELL2000: Full IWM constituent list ~2000 stocks — more signals, more noise
+# Set UNIVERSE_MODE to switch. Russell 2000 requires stricter firewalls.
+UNIVERSE_MODE      = "WATCHLIST"     # "WATCHLIST" | "RUSSELL2000"
+
 # ── Thresholds ───────────────────────────────────────────────
-MIDCAP_MIN         = 300_000_000    # $300M minimum — covers small/mid-cap watchlist
-MIDCAP_MAX         = 15_000_000_000  # $15B maximum
+MIDCAP_MIN         = 300_000_000    # $300M — covers small/mid-cap watchlist
+MIDCAP_MAX         = 15_000_000_000  # $15B max
 ACCOUNT_SIZE       = float(os.environ.get("ACCOUNT_SIZE", 50000))
 SIGNAL_THRESHOLD   = 65
 ATR_STOP_MULT      = 1.5
-ATR_TARGET_MULT    = 3.0             # Used in TREND mode only
+ATR_TARGET_MULT    = 3.0
 SPY_WEAK_THRESH    = -0.005
-SECTOR_RS_MIN      = 1.01            # Sector must lead SPY by 1% (1.05 was too strict for normal markets)
+SECTOR_RS_MIN      = 1.01
 HAWKES_DECAY       = 0.3
-OFI_LONG_ENTRY     = 0.30            # Adaptive base (overridden by regime)
+OFI_LONG_ENTRY     = 0.30
 OFI_SHORT_ENTRY    = -0.30
 OFI_LONG_EXIT      = 0.45
 OFI_SHORT_EXIT     = 0.55
 ZSCORE_MAX         = 2.5
 ZSCORE_MIN         = -2.5
-Z_ENTRY_THRESH     = 2.0             # Exhaustion entry threshold
+Z_ENTRY_THRESH     = 2.0
 KURTOSIS_MIN       = 3.0
 SKEW_LONG_MIN      = 0.1
 SKEW_SHORT_MAX     = -0.1
@@ -129,24 +135,392 @@ GAP_DOWN_THRESH    = -0.010
 LOWER_LOW_BARS     = 6
 
 # ── Liquidity Firewall ────────────────────────────────────────
-MIN_DOLLAR_VOLUME  = 5_000_000       # $5M avg daily dollar volume
-MIN_REL_VOLUME     = 1.2             # Current volume must be 1.2x average (1.5 blocked off-peak scans)
+MIN_DOLLAR_VOLUME  = 5_000_000       # $5M default (watchlist)
+MIN_REL_VOLUME     = 1.2             # 1.2x default
+
+# ── Russell 2000 Stricter Thresholds ─────────────────────────
+R2K_MIN_DOLLAR_VOLUME = 20_000_000  # $20M — doc spec §7: "$20M+ for execution"
+R2K_MIN_REL_VOLUME    = 1.5         # 1.5x
+R2K_SIGNAL_THRESHOLD  = 72          # "Best of best" from 2000 stocks
+R2K_HURST_MIN         = 0.55        # Clean trend required
+R2K_HAWKES_MIN        = 62          # Higher clustering bar
+R2K_MIN_PRICE         = 5.0         # No penny stocks
+R2K_BATCH_SIZE        = 500         # Rate limit protection
+R2K_RF_LENGTH         = 25          # Adaptive base for small-cap speed
+
+# ── Portfolio Risk Controls (§8) ─────────────────────────────
+MAX_OPEN_POSITIONS    = 5            # Hard cap — prevents overtrading
+MAX_SECTOR_POSITIONS  = 2            # Max 2 per sector at once
+MAX_TOTAL_RISK_PCT    = 0.05         # Max 5% of account in open risk
+
+# ── Execution Rules ───────────────────────────────────────────
+LIMIT_ORDERS_ONLY     = True         # §12: never use market orders
+MAX_TRADES_PER_DAY    = 20           # §12: slippage accumulates — cap daily trades
+
+# ── Exit Rules ───────────────────────────────────────────────
+PARTIAL_TP_PCT        = 0.50         # §13: take 50% off at first target
+EOD_SOFT_EXIT_HOUR    = 15           # 3:00 PM — begin closing
+EOD_SOFT_EXIT_MIN     = 30           # 3:30 PM soft exit
+EOD_HARD_EXIT_HOUR    = 15           # 3:55 PM hard exit all
+EOD_HARD_EXIT_MIN     = 55
+
+# ── Half-Life Minimums (§6) ───────────────────────────────────
+HALFLIFE_MIN_REMAINING_SCALP    = 30   # seconds — reject if < 30s for scalps
+HALFLIFE_MIN_REMAINING_INTRADAY = 120  # seconds — reject if < 2min for intraday
+
+# ── Global Controls ───────────────────────────────────────────
+GLOBAL_KILL_SWITCH    = False        # §10: set True to halt all new entries
+GLOBAL_REGIME_LOCK    = None         # §3: "TREND"|"MEAN_REVERSION"|None (auto)
 
 # ── Strategy Switch ───────────────────────────────────────────
-# TREND:         Hurst + Hawkes momentum — for trending/volatile markets
-# MEAN_REVERSION: Z-score exhaustion + VWAP reversion — for ranging markets
-# AUTO:          ADX + SPY vol determines which mode fires (recommended)
-STRATEGY_MODE      = "AUTO"          # "TREND" | "MEAN_REVERSION" | "AUTO"
+STRATEGY_MODE      = "AUTO"
 
 # ── Mean Reversion Exit ───────────────────────────────────────
-MR_TAKE_PROFIT_PCT = 0.005           # 0.5% scalp target
-MR_STOP_LOSS_PCT   = 0.008           # 0.8% hard stop
+MR_TAKE_PROFIT_PCT = 0.005
+MR_STOP_LOSS_PCT   = 0.008
 
 # ── ADX Regime ───────────────────────────────────────────────
-ADX_MAX            = 25              # Above this = strong trend = no mean reversion
-SPY_VOL_NOTRADE    = 0.020           # SPY move > 2.0% = no-trade zone (1.5% was too tight)
-SPY_VOL_CALM       = 0.005           # < 0.5% = calm market
-SPY_VOL_NORMAL     = 0.010           # 0.5–1.0% = normal market
+ADX_MAX            = 25
+SPY_VOL_NOTRADE    = 0.020
+SPY_VOL_CALM       = 0.005
+SPY_VOL_NORMAL     = 0.010
+
+
+# ── Range Filter (ThinkScript port) ──────────────────────────
+# Final confirmation gate: scanner finds mathematical exhaustion,
+# Range Filter confirms price has actually started moving in your favor.
+# Final_Signal = (Score > 75) AND (price > filter AND upward > 0)
+# Ported from ThinkorSwim RangeFilter study.
+
+def compute_range_filter(prices: np.ndarray, length: int = 25) -> tuple:
+    """
+    Range Filter — ported from ThinkScript.
+    Returns (filter_val, upward, downward, signal_up, signal_down).
+
+    signal_up   = True when price crosses above filter AND trend is up
+    signal_down = True when price crosses below filter AND trend is down
+
+    length=25 for Russell 2000 (was 100 in TOS — too slow for small-caps)
+    length=30 for 5-min chart, length=20 for 1-min chart
+
+    ThinkScript logic:
+      range = ATR(length) * multiplier
+      if price > filter + range: filter = price - range
+      if price < filter - range: filter = price + range
+      upward   = filter > filter[1]
+      downward = filter < filter[1]
+    """
+    if len(prices) < length + 2:
+        return prices[-1], False, False, False, False
+
+    # Compute smooth range using ATR-like rolling std
+    n      = len(prices)
+    smrng  = np.zeros(n)
+    for i in range(length, n):
+        smrng[i] = np.std(prices[i-length:i], ddof=1) * 1.0  # multiplier=1.0
+
+    filt   = np.zeros(n)
+    filt[length] = prices[length]
+
+    for i in range(length + 1, n):
+        rng = smrng[i]
+        if prices[i] > filt[i-1] + rng:
+            filt[i] = prices[i] - rng
+        elif prices[i] < filt[i-1] - rng:
+            filt[i] = prices[i] + rng
+        else:
+            filt[i] = filt[i-1]
+
+    upward   = filt[-1] > filt[-2]
+    downward = filt[-1] < filt[-2]
+
+    # Signal: price crosses filter in direction of trend
+    signal_up   = prices[-1] > filt[-1] and upward
+    signal_down = prices[-1] < filt[-1] and downward
+
+    return round(float(filt[-1]), 4), upward, downward, signal_up, signal_down
+
+
+# ── Active Thresholds (adapts to UNIVERSE_MODE) ──────────────────────────────
+
+def get_active_thresholds() -> dict:
+    """Returns correct thresholds for current universe mode."""
+    if UNIVERSE_MODE == "RUSSELL2000":
+        return {
+            "min_dollar_vol":  R2K_MIN_DOLLAR_VOLUME,
+            "min_rel_vol":     R2K_MIN_REL_VOLUME,
+            "signal_thresh":   R2K_SIGNAL_THRESHOLD,
+            "hurst_min":       R2K_HURST_MIN,
+            "hawkes_min":      R2K_HAWKES_MIN,
+            "min_price":       R2K_MIN_PRICE,
+            "batch_size":      R2K_BATCH_SIZE,
+            "rf_length":       R2K_RF_LENGTH,
+        }
+    return {
+        "min_dollar_vol":  MIN_DOLLAR_VOLUME,
+        "min_rel_vol":     MIN_REL_VOLUME,
+        "signal_thresh":   SIGNAL_THRESHOLD,
+        "hurst_min":       0.0,
+        "hawkes_min":      0.0,
+        "min_price":       1.0,
+        "batch_size":      500,
+        "rf_length":       30,
+    }
+
+
+# ── Global Kill Switch (§10) ──────────────────────────────────────────────────
+
+def is_trading_allowed() -> tuple:
+    """
+    Global no-trade gate. Returns (allowed: bool, reason: str).
+    Checked before every signal is acted upon.
+    Blocks if:
+      - GLOBAL_KILL_SWITCH is True (manual override)
+      - GLOBAL_REGIME_LOCK is set and contradicts current strategy
+      - Past EOD hard exit time
+    """
+    if GLOBAL_KILL_SWITCH:
+        return False, "GLOBAL_KILL_SWITCH=True — all entries halted"
+
+    now = datetime.now()
+    # Before market open
+    if now.hour < 9 or (now.hour == 9 and now.minute < 30):
+        return False, "PRE_MARKET — no entries before 9:30 AM"
+    # Hard EOD exit
+    if now.hour > EOD_HARD_EXIT_HOUR or \
+       (now.hour == EOD_HARD_EXIT_HOUR and now.minute >= EOD_HARD_EXIT_MIN):
+        return False, f"EOD_HARD_EXIT — past {EOD_HARD_EXIT_HOUR}:{EOD_HARD_EXIT_MIN:02d} PM"
+
+    return True, "OK"
+
+
+def is_eod_soft_exit() -> bool:
+    """True between 3:30 PM and 3:55 PM — close winners, no new entries."""
+    now = datetime.now()
+    soft = now.hour == EOD_SOFT_EXIT_HOUR and now.minute >= EOD_SOFT_EXIT_MIN
+    hard = now.hour == EOD_HARD_EXIT_HOUR and now.minute >= EOD_HARD_EXIT_MIN
+    return soft and not hard
+
+
+# ── Portfolio Risk Controls (§8) ─────────────────────────────────────────────
+
+def portfolio_allows_entry(symbol: str, sector_etf: str,
+                            positions: dict, account_size: float) -> tuple:
+    """
+    Enforces §8 hard limits before any new position opens.
+    Returns (allowed: bool, reason: str).
+
+    Checks:
+      1. Max open positions = 5
+      2. Max positions per sector = 2
+      3. Max total account risk = 5%
+    """
+    open_pos = {sym: p for sym, p in positions.items()
+                if p.direction != "FLAT"}
+
+    # Rule 1: Max open positions
+    if len(open_pos) >= MAX_OPEN_POSITIONS:
+        return False, f"MAX_POSITIONS: {len(open_pos)}/{MAX_OPEN_POSITIONS} open"
+
+    # Rule 2: Max per sector
+    sector_count = sum(
+        1 for sym, p in open_pos.items()
+        if SECTOR_MAP.get(sym, "SPY") == sector_etf
+    )
+    if sector_count >= MAX_SECTOR_POSITIONS:
+        return False, f"MAX_SECTOR: {sector_count}/{MAX_SECTOR_POSITIONS} in {sector_etf}"
+
+    # Rule 3: Max total account risk
+    total_risk = sum(
+        abs(p.entry_price - p.stop) * p.shares
+        for p in open_pos.values()
+        if p.stop > 0 and p.entry_price > 0
+    )
+    risk_pct = total_risk / account_size if account_size > 0 else 0.0
+    if risk_pct >= MAX_TOTAL_RISK_PCT:
+        return False, f"MAX_RISK: {risk_pct:.1%} of account at risk (max {MAX_TOTAL_RISK_PCT:.0%})"
+
+    return True, f"OK — {len(open_pos)} open, {sector_count} in {sector_etf}, {risk_pct:.1%} at risk"
+
+
+# ── Pre-Trade Validation Layer (§2.2) ────────────────────────────────────────
+
+def validate_before_execute(result: dict, current_price: float,
+                              positions: dict) -> tuple:
+    """
+    Critical re-validation before any order is placed.
+    Scanner signal may be stale by the time execution is ready.
+
+    Returns (valid: bool, reason: str).
+
+    Checks:
+      1. Global kill switch / EOD
+      2. Signal half-life still alive (min threshold)
+      3. Price hasn't drifted more than 0.5% from signal price
+      4. Range Filter still confirming
+      5. Market regime hasn't flipped
+      6. Portfolio limits allow new position
+    """
+    sym        = result.get("symbol","?")
+    signal_px  = float(result.get("price", 0))
+    hl_alive   = bool(result.get("hl_alive", False))
+    hl_rem     = float(result.get("hl_remaining", 0))
+    rf_confirms= bool(result.get("rf_confirms", False))
+    strategy   = result.get("strategy","—")
+    sector_etf = result.get("sector_etf","SPY")
+
+    # 1. Global gate
+    allowed, reason = is_trading_allowed()
+    if not allowed:
+        return False, reason
+
+    # 2. Half-life minimum — choose threshold based on mode
+    min_hl = (HALFLIFE_MIN_REMAINING_SCALP if UNIVERSE_MODE == "RUSSELL2000"
+              else HALFLIFE_MIN_REMAINING_INTRADAY)
+    if not hl_alive or hl_rem < min_hl:
+        return False, f"SIGNAL_EXPIRED: {hl_rem:.0f}s remaining (min {min_hl}s)"
+
+    # 3. Price drift — reject if moved more than 0.5% from signal
+    if signal_px > 0:
+        drift = abs(current_price - signal_px) / signal_px
+        if drift > 0.005:
+            return False, f"PRICE_DRIFT: {drift:.2%} from signal price ${signal_px:.2f}"
+
+    # 4. Range Filter still confirming
+    if not rf_confirms:
+        return False, "RF_NO_CONFIRM: Range Filter no longer confirming direction"
+
+    # 5. GLOBAL_REGIME_LOCK check
+    if GLOBAL_REGIME_LOCK and GLOBAL_REGIME_LOCK != strategy:
+        return False, f"REGIME_LOCK: system locked to {GLOBAL_REGIME_LOCK}, signal is {strategy}"
+
+    # 6. Portfolio limits
+    port_ok, port_reason = portfolio_allows_entry(sym, sector_etf, positions, ACCOUNT_SIZE)
+    if not port_ok:
+        return False, port_reason
+
+    return True, f"VALID — hl={hl_rem:.0f}s drift={abs(current_price-signal_px)/signal_px*100:.2f}%"
+
+
+# ── Adaptive Range Filter Length (§5.1) ──────────────────────────────────────
+
+def adaptive_rf_length(atr_pct: float, universe: str = "WATCHLIST") -> int:
+    """
+    §5.1: RF length must adapt to volatility — not static.
+
+    High volatility:  shorter length (20–30) → more responsive
+    Low volatility:   longer length (40–60)  → filters more noise
+
+    atr_pct: ATR as % of price (e.g., 0.025 = 2.5%)
+    """
+    if universe == "RUSSELL2000":
+        # Small-caps: tighter ranges
+        if atr_pct > 0.04:   return 20   # very volatile
+        if atr_pct > 0.025:  return 25   # normal small-cap
+        return 30                          # low volatility
+    else:
+        # Watchlist / mid-cap
+        if atr_pct > 0.03:   return 30
+        if atr_pct > 0.015:  return 40
+        return 50
+
+
+# ── Relative Ranking (§9) ─────────────────────────────────────────────────────
+
+def rank_signals(df: pd.DataFrame, top_n: int = 10,
+                 top_pct: float = 0.05) -> pd.DataFrame:
+    """
+    §9: With 2000 stocks, fixed score thresholds become unreliable.
+    Replace with relative ranking:
+      - top_n:   return best N results regardless of absolute score
+      - top_pct: return top X% of all scanned (e.g., top 5%)
+    Both filters applied — stricter of the two wins.
+
+    Also adds a 'rank' and 'percentile' column to the DataFrame.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df["rank"]       = df["score"].rank(ascending=False, method="first").astype(int)
+    df["percentile"] = (1 - df["score"].rank(pct=True)).round(4)
+
+    n_from_pct = max(1, int(len(df) * top_pct))
+    cutoff_n   = min(top_n, n_from_pct)
+
+    ranked = df.nsmallest(cutoff_n, "rank").reset_index(drop=True)
+    return ranked
+
+
+# ── Partial Take Profit (§13) ─────────────────────────────────────────────────
+
+def determine_exit_with_partial(current_price: float, entry_price: float,
+                                  vwap: float, side: str,
+                                  shares_remaining: int) -> tuple:
+    """
+    §13: Two-stage exit:
+      Stage 1 — Take 50% off at first target (VWAP touch or 0.5% TP)
+      Stage 2 — Trail remaining 50% until hard stop or 0.8% TP
+
+    Returns (action: str, shares_to_close: int, reason: str).
+    Actions: "PARTIAL_EXIT" | "FULL_EXIT" | "HOLD"
+    """
+    half = max(1, shares_remaining // 2)
+
+    if side == "LONG":
+        at_target = current_price >= vwap or \
+                    current_price >= entry_price * (1 + MR_TAKE_PROFIT_PCT)
+        at_stop   = current_price <= entry_price * (1 - MR_STOP_LOSS_PCT)
+
+        if at_stop:
+            return "FULL_EXIT",    shares_remaining, f"STOP_LOSS at ${current_price:.2f}"
+        if at_target and shares_remaining > half:
+            return "PARTIAL_EXIT", half, f"PARTIAL_TP 50% at ${current_price:.2f}"
+        if at_target:
+            return "FULL_EXIT",    shares_remaining, f"FULL_TP at ${current_price:.2f}"
+
+    if side == "SHORT":
+        at_target = current_price <= vwap or \
+                    current_price <= entry_price * (1 - MR_TAKE_PROFIT_PCT)
+        at_stop   = current_price >= entry_price * (1 + MR_STOP_LOSS_PCT)
+
+        if at_stop:
+            return "FULL_EXIT",    shares_remaining, f"STOP_LOSS at ${current_price:.2f}"
+        if at_target and shares_remaining > half:
+            return "PARTIAL_EXIT", half, f"PARTIAL_TP 50% at ${current_price:.2f}"
+        if at_target:
+            return "FULL_EXIT",    shares_remaining, f"FULL_TP at ${current_price:.2f}"
+
+    return "HOLD", 0, "HOLD"
+
+
+# ── EOD Exit Check (§13) ──────────────────────────────────────────────────────
+
+def check_eod_exit(positions: dict) -> list:
+    """
+    §13: End-of-day exit — eliminates overnight risk.
+    3:30–3:55 PM: close winning positions first (soft exit)
+    3:55 PM+:     close everything hard (hard exit)
+
+    Returns list of symbols to close with reason.
+    """
+    now = datetime.now()
+    to_close = []
+
+    hard = (now.hour > EOD_HARD_EXIT_HOUR or
+            (now.hour == EOD_HARD_EXIT_HOUR and now.minute >= EOD_HARD_EXIT_MIN))
+    soft = (now.hour == EOD_SOFT_EXIT_HOUR and
+            now.minute >= EOD_SOFT_EXIT_MIN and not hard)
+
+    for sym, pos in positions.items():
+        if pos.direction == "FLAT":
+            continue
+        if hard:
+            to_close.append((sym, "EOD_HARD_EXIT — 3:55 PM all positions closed"))
+        elif soft and pos.pnl > 0:
+            to_close.append((sym, f"EOD_SOFT_EXIT — closing winner ${pos.pnl:+.2f}"))
+
+    return to_close
 
 
 # ── Market Cap Filter ─────────────────────────────────────────────────────────
@@ -1028,8 +1402,36 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
     strength, hl_rem, hl_alive = halflife_remaining(symbol, comp, price, atr)
     kf, drisk, shares = kelly_size(price, atr, win_rate=bayes_p) if alert else (0.0, 0.0, 0)
 
+    # ── Range Filter (final confirmation gate) ────────────────
+    # Confirms price has started moving in your favor BEFORE entry.
+    # Final_Signal = (Score > 75) AND (price > rf_val AND rf_upward)
+    # Russell 2000: rf_length=25 (faster). Watchlist: rf_length=30.
+    thresholds = get_active_thresholds()
+    # §5.1: Adaptive RF length based on actual stock volatility
+    atr_pct = (atr / price) if price > 0 else 0.02
+    rf_len  = adaptive_rf_length(atr_pct, UNIVERSE_MODE)
+    rf_val, rf_up, rf_dn, rf_sig_up, rf_sig_dn = compute_range_filter(closes, length=rf_len)
+    # Range filter confirmation: direction must match signal
+    if direction_g == "LONG":
+        rf_confirms = rf_sig_up
+    else:
+        rf_confirms = rf_sig_dn
+
+    # R2K mode applies stricter signal threshold and Hurst/Hawkes bars
+    if UNIVERSE_MODE == "RUSSELL2000":
+        r2k_ok = (comp >= thresholds["signal_thresh"] and
+                  H_daily >= thresholds["hurst_min"] and
+                  hawk_sc >= thresholds["hawkes_min"])
+    else:
+        r2k_ok = True  # watchlist mode — standard threshold
+
+    # Final combined alert gate
+    alert_final = alert and r2k_ok
+    # Range filter warning — doesn't block but shown on card
+    rf_warning = alert_final and not rf_confirms
+
     return {
-        "symbol":symbol,"price":round(price,2),"score":comp,"alert":alert,
+        "symbol":symbol,"price":round(price,2),"score":comp,"alert":alert_final,
         "mode":mode,"strategy":strategy,"exit_type":exit_type,
         "adx":adx_val,"regime_reason":regime_reason,"adaptive_ofi":adaptive_ofi,
         # Hurst
@@ -1057,16 +1459,19 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         "intraday_ret":hd.get("intraday_ret",0.0),"gap_ret":hd.get("gap_ret",0.0),
         "below_vwap":hd.get("below_vwap",False),
         "mcap_b":mcap_b,"scanned_at":datetime.now().strftime("%H:%M:%S"),
+        # ── Range Filter ──────────────────────────────────────
+        "rf_val":round(rf_val,4),"rf_up":rf_up,"rf_dn":rf_dn,
+        "rf_confirms":rf_confirms,"rf_warning":rf_warning,
+        "rf_length":rf_len,
         # ── Golden Entry flag ─────────────────────────────────
-        # True when BOTH conditions align for ideal MR long setup:
-        #   Z-score <= -2.0  (price statistically oversold)
-        #   Price below VWAP (below institutional fair value)
-        # This is the exact rubber-band stretch the exhaustion engine targets.
+        # Z-score <= -2.0 + below VWAP + MR mode = textbook rubber-band setup
         "golden_entry": (
             float(z) <= -Z_ENTRY_THRESH and
             hd.get("below_vwap", False) and
             strategy == "MEAN_REVERSION"
         ),
+        # ── Universe mode tag ─────────────────────────────────
+        "universe_mode": UNIVERSE_MODE,
     }
 
 
@@ -1146,8 +1551,15 @@ def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
         "rejected_detail":rejected,   # full detail for dashboard
     })
     if not results: return pd.DataFrame(), market
-    return pd.DataFrame(results).sort_values(by=["score","bayes_prob"],
-                                              ascending=False).reset_index(drop=True), market
+    df_raw = pd.DataFrame(results).sort_values(by=["score","bayes_prob"],
+                                                ascending=False).reset_index(drop=True)
+    # §9: Apply relative ranking for R2K (top N% not fixed threshold)
+    if UNIVERSE_MODE == "RUSSELL2000":
+        df_raw = rank_signals(df_raw, top_n=20, top_pct=0.05)
+    else:
+        df_raw["rank"]       = range(1, len(df_raw)+1)
+        df_raw["percentile"] = (df_raw.index / len(df_raw)).round(4)
+    return df_raw, market
 
 
 # ── Universe Scanner ──────────────────────────────────────────────────────────
@@ -1252,6 +1664,205 @@ def run_universe_scan(top_n: int = 30, timeframe: str = "5m") -> pd.DataFrame:
     print(f"[UNIVERSE] Saved top {top_n} → auto_watchlist.txt")
     export_excel(df, market)
     return df
+
+
+# ── Russell 2000 Batched Scanner ─────────────────────────────────────────────
+# Scans the full IWM constituent list in batches of 500 to avoid rate limits.
+# Applies R2K-specific stricter thresholds automatically.
+# Run: set UNIVERSE_MODE = "RUSSELL2000" then call run_russell2000_scan()
+
+# Full Russell 2000 constituent list — loaded from IWM holdings or static list
+# This is a representative subset; for live use fetch from iShares IWM holdings
+RUSSELL2000_SYMBOLS = [
+    # Technology
+    "ACLS","ADTH","AEHR","AGYS","ALLT","AMSWA","AOSL","APPF","ARLO","ATEN",
+    "ATNI","AVNW","AXNX","BAND","BCOV","BLKB","BSIG","CASS","CEVA","CGNT",
+    "CLFD","CLPS","CMPR","CNXC","COHU","CSTL","CSWI","DOMO","DTIL","DTST",
+    "EBIX","EDAC","EGAN","EGHT","ENVA","EVTC","EXPI","EXLP","FCRD","FIVN",
+    "FORM","FORR","GDOT","GEOS","GLNG","GNSS","GRPN","GTLB","HCAT","HIMX",
+    "HOLI","HUBS","IESC","IPAR","IRDM","IRTC","ITRI","JAMF","JNPR","KVHI",
+    "LSCC","LSTR","LYTS","MARA","MGNI","MLAB","MMSI","MODV","MODN","MORN",
+    "MRCY","MTSI","NTGR","NTRA","NVAX","ONTO","POWI","PRCT","PSTG","PWSC",
+    "QADA","QNST","RAMP","SCSC","SHEN","SIFY","SILK","SMTC","SPOK","SSYS",
+    "STRL","TASK","TCMD","TELOS","TTEC","TUYA","TZOO","VCRA","VIAV","VNET",
+    # Healthcare
+    "ACAD","ACET","ACLS","ACMR","ADMA","AGIO","AKCA","ALDX","ALEC","ALOG",
+    "AMPH","AMRX","ARWR","ATRC","AVDL","AXDX","AXGT","BCPC","BIIB","BLFS",
+    "BPMC","BTBT","CALA","CALX","CAMT","CASI","CBPO","CCRN","CDMO","CDNA",
+    "CERO","CGEM","CGEN","CHRS","CLOV","CMPS","CNMD","CODX","CORT","CPRX",
+    "CRVL","CSTE","CTLT","CTMX","CVAC","CYTK","DRIO","DYAI","ENTA","ESTE",
+    "EVIO","EVLO","FATE","FDMT","FGEN","FOLD","FREQ","GALT","GERN","GKOS",
+    "GLPG","GNCA","GNFT","GOSS","GRTS","HALO","HCAT","HIMS","HROW","HRMY",
+    "HTBK","IMCR","IMGO","IMTX","IMVT","INDB","INMD","IONS","IOVA","IPHA",
+    "KRYS","KRTX","LGND","LNTH","MGNX","MYGN","NKTR","NTRA","NUVL","NVAX",
+    "OCGN","OCUL","OMCL","OPCH","OPRT","ORGO","PCRX","PDCO","PDLI","PRME",
+    # Financials
+    "ABR","ACNB","AFCG","ALEX","AMAL","AMNB","AMTB","ANCX","AROW","ATLC",
+    "ATLO","BANC","BANF","BANR","BBCP","BCAR","BCML","BCSB","BFIN","BFST",
+    "BHLB","BKNG","BKSC","BLMN","BMRC","BNCN","BOCH","BOKF","BPOP","BRKL",
+    "BSVN","BUSE","BYFC","CABO","CADE","CAR","CARE","CASH","CATO","CBFV",
+    "CBSH","CBTX","CCBG","CCNE","CFFN","CFFI","CFNB","CHCO","CHMG","CIVB",
+    "CLBK","CLDB","CMTV","CNOB","COOP","CORE","CRAI","CRBP","CSTR","CTBI",
+    "CUBI","CURE","CURO","CVBF","CVCY","CZWI","DCOM","DENN","DFIN","DGICA",
+    "EBMT","ECPG","EFSC","EFC","ENVA","ESSA","EVBN","EVTC","FBIZ","FBMS",
+    # Industrials / Energy / Materials
+    "ASTE","ASTL","ATRI","AVAV","AVNT","AZTA","BATL","BCPC","BWXT","CIVI",
+    "CLW","CMCO","CNSL","CRS","CSWI","CWST","DAN","DXPE","ECCA","ENVA",
+    "EPAC","ERII","FBHS","FELE","FSTR","GATX","GFF","GHM","GLDD","GNRC",
+    "GTLS","HAYW","HEES","HLIO","HURC","HWKN","HYMC","IESC","ITRI","JBSS",
+    "KELYA","KTOS","KWR","LBAI","LCII","LCUT","LECO","LYTS","MATW","MATX",
+    "MBIN","MCBC","MCRI","MDRX","MERC","MGPI","MNRO","MRTN","MRUS","MSEX",
+    "MTDR","NNBR","NOMD","NOVT","NSP","OBNK","OSIS","PTEN","REX","RYAM",
+    "SCVL","SHYF","SPXC","STAG","STRL","SUNL","SUPN","SVRA","SWBI","TCBK",
+    "TROX","TRST","TTGT","TUEM","UFCS","UFPT","UITB","ULCC","UONE","USAC",
+    "VBTX","VICR","VSCO","VTOL","WABC","WASH","WCBI","WERN","WTBA","WTTR",
+]
+
+def fetch_russell2000_symbols() -> list:
+    """
+    Attempts to fetch live IWM constituent list from iShares.
+    Falls back to built-in RUSSELL2000_SYMBOLS list if unavailable.
+    """
+    try:
+        import urllib.request, json
+        url = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?tab=holdings&fileType=json"
+        req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        syms = [row[0] for row in data.get("aaData",[]) if row[0] and len(row[0]) <= 5]
+        if len(syms) > 100:
+            print(f"[R2K] Fetched {len(syms)} live IWM constituents")
+            return syms
+    except Exception as e:
+        print(f"[R2K] Live fetch failed ({e}), using built-in list")
+    return RUSSELL2000_SYMBOLS
+
+
+def run_russell2000_scan(timeframe: str = "5m", top_n: int = 30) -> tuple:
+    """
+    Full Russell 2000 scan in batches of 500 to avoid yfinance rate limits.
+
+    Architecture:
+      1. Fetch constituent list (live from iShares or built-in)
+      2. Stage 1 fast prefilter: price > $5, avg vol > 300K, ATR% > 2%
+         Done in batches of 500 via yf.download() — much faster than per-symbol
+      3. Stage 2 full scan: all 10 layers on survivors
+         Uses R2K stricter thresholds: $10M vol, 1.5x RelVol, score > 72
+
+    Rate limit strategy: 3-second pause between 500-symbol batches.
+    Expected time: ~8–12 min for full 2000 symbol scan.
+    Expected survivors: 15–40 stocks depending on market conditions.
+    """
+    global UNIVERSE_MODE
+    original_mode = UNIVERSE_MODE
+    UNIVERSE_MODE = "RUSSELL2000"  # Activate stricter thresholds
+
+    thresholds = get_active_thresholds()
+    batch_size = thresholds["batch_size"]
+    min_price  = thresholds["min_price"]
+
+    print(f"\n[R2K] Starting Russell 2000 scan at {datetime.now().strftime('%H:%M:%S')}")
+    print(f"[R2K] Thresholds: DV>${thresholds['min_dollar_vol']/1e6:.0f}M "
+          f"RelVol>{thresholds['min_rel_vol']}x "
+          f"Score>{thresholds['signal_thresh']}")
+
+    symbols = fetch_russell2000_symbols()
+    print(f"[R2K] Universe: {len(symbols)} symbols → scanning in batches of {batch_size}")
+
+    # Stage 1: fast prefilter in batches
+    survivors = []
+    batches = [symbols[i:i+batch_size] for i in range(0, len(symbols), batch_size)]
+
+    for b_idx, batch in enumerate(batches):
+        print(f"[R2K] Prefilter batch {b_idx+1}/{len(batches)} ({len(batch)} symbols)...")
+        try:
+            raw = yf.download(
+                batch, period="1mo", interval="1d",
+                group_by="ticker", auto_adjust=True,
+                progress=False, threads=True
+            )
+            for sym in batch:
+                try:
+                    df = raw[sym] if len(batch) > 1 else raw
+                    if df is None or df.empty or len(df) < 10: continue
+                    df.columns = [c.lower() for c in df.columns]
+                    if "close" not in df.columns: continue
+                    p = float(df["close"].iloc[-1])
+                    if p < min_price: continue
+                    if float(df["volume"].mean()) < 300_000: continue
+                    atr_pct = float(df["close"].diff().abs().mean() / p)
+                    if atr_pct < 0.02: continue
+                    survivors.append(sym)
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[R2K] Batch {b_idx+1} failed: {e}")
+        # Rate limit pause between batches
+        if b_idx < len(batches) - 1:
+            time.sleep(3)
+
+    print(f"[R2K] Stage 1 complete: {len(symbols)} → {len(survivors)} survivors")
+
+    # Stage 2: full 10-layer scan on survivors
+    market  = get_market_regime()
+    results = []
+    rejected= []
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _r2k_scan_one(sym):
+        try:
+            df_d = fetch_daily(sym, 60)
+            if df_d is None or len(df_d) < 30:
+                return sym, None, "NO_DATA", "Insufficient bars"
+            liq_ok, liq_msg = passes_liquidity_firewall(df_d, sym)
+            if not liq_ok:
+                return sym, None, "LIQUIDITY", liq_msg
+            r = scan_symbol(sym, market, timeframe)
+            if r: return sym, r, None, None
+            return sym, None, "SCAN_FAILED", "Below threshold"
+        except Exception as e:
+            return sym, None, "ERROR", str(e)[:80]
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_r2k_scan_one, sym): sym for sym in survivors}
+        for fut in as_completed(futures):
+            sym, r, reason, detail = fut.result()
+            if r:   results.append(r)
+            else:   rejected.append({"symbol":sym,"reason":reason,"detail":detail or ""})
+            done += 1
+            if done % 20 == 0:
+                print(f"[R2K] Stage 2: {done}/{len(survivors)} scanned, {len(results)} passed")
+
+    UNIVERSE_MODE = original_mode  # Restore
+
+    if not results:
+        print("[R2K] No results passed all filters")
+        return pd.DataFrame(), market
+
+    df = (pd.DataFrame(results)
+          .sort_values(by=["golden_entry","score","bayes_prob"],
+                       ascending=[False, False, False])
+          .reset_index(drop=True))
+
+    # Save top picks to watchlist
+    top = df.head(top_n)["symbol"].tolist()
+    with open("r2k_watchlist.txt", "w") as f:
+        f.write("\n".join(top))
+
+    market.update({
+        "rejected_detail": rejected,
+        "blocked_count":   len(rejected),
+        "scanned":         len(results),
+    })
+
+    print(f"[R2K] Complete: {len(results)} passed, "
+          f"{len(df[df['golden_entry']==True])} Golden Entries, "
+          f"{len(df[df['alert']==True])} signals")
+    print(f"[R2K] Top {top_n} saved to r2k_watchlist.txt")
+
+    return df, market
 
 
 # ── Excel Export ──────────────────────────────────────────────────────────────
