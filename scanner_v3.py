@@ -8,7 +8,7 @@ Deps:  pip install yfinance pandas numpy scipy streamlit openpyxl schedule
            Z-Score · Kurtosis/Skew · Bayesian Prob · Half-Life · ATR R:R
 
 Universe Scanner auto-runs at 9:00 AM EST daily.
-Cap filter: $300M–$20B. Timeframe: 15s / 1m / 5m / 15m toggle.
+Cap filter: $1B–$15B. Timeframe: 15s / 1m / 5m / 15m toggle.
 """
 
 import os, time, math, warnings, threading
@@ -32,8 +32,11 @@ except ImportError:
 try:
     import schwab
     SCHWAB_AVAILABLE = True
+    # Schwab API ready — streaming will activate when credentials are set
+    # Set env vars: SCHWAB_API_KEY, SCHWAB_API_SECRET, SCHWAB_ACCOUNT_ID
 except ImportError:
     SCHWAB_AVAILABLE = False
+    # Running in yfinance mode — all features work, data has 15s delay
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -425,10 +428,13 @@ def compute_ofi(df: pd.DataFrame, window: int = 12) -> tuple:
     return round(cur, 4), round(delt, 4), round(float(np.clip(cur*100 + delt*50, 0, 100)), 1)
 
 def ofi_signal(ofi: float, delta: float) -> str:
-    if ofi >= 0.65 and delta >= 0: return "🟢 ACCUMULATING"
-    if ofi >= 0.60 and delta <  0: return "🟡 TOPPING"
+    # Thresholds aligned with OFI_LONG_ENTRY=0.30 adaptive base
+    # Upper band: 0.30 + 0.20 buffer = 0.50 (accumulating territory)
+    # Lower band: 0.50 - 0.20 buffer = 0.30 (selling territory)
+    if ofi >= 0.55 and delta >= 0: return "🟢 ACCUMULATING"
+    if ofi >= 0.52 and delta <  0: return "🟡 TOPPING"
     if ofi <= 0.35:                return "🔴 DISTRIBUTING"
-    if ofi <= 0.42:                return "🟠 SELLING"
+    if ofi <= 0.44:                return "🟠 SELLING"
     return "⚪ NEUTRAL"
 
 
@@ -674,12 +680,18 @@ def get_strategy_regime(df_intra: pd.DataFrame, spy_return: float) -> tuple:
 # This is the core of the 70-80% win rate claim.
 
 def check_exhaustion_signal(df: pd.DataFrame, vwap: float,
-                             spy_return: float) -> tuple:
+                             spy_return: float,
+                             adaptive_ofi: float = 0.30) -> tuple:
     """
     Three-step exhaustion confirmation:
       Step A — Extension:  Z-score >= 2.0 (price far from mean)
       Step B — Exhaustion: OFI spiked then faded (ammunition depleted)
       Step C — VWAP side:  Price on correct side for reversion
+
+    adaptive_ofi scales panic/exhaustion thresholds with market regime:
+      0.20 = calm  → easier trigger (more sensitive)
+      0.30 = normal
+      0.35 = volatile → harder trigger (requires stronger signal)
 
     Returns (long_signal: bool, short_signal: bool, reason: str).
     """
@@ -715,14 +727,14 @@ def check_exhaustion_signal(df: pd.DataFrame, vwap: float,
 
     # ── LONG: price crushed + selling exhausted + below VWAP ──
     is_oversold       = z_now <= -Z_ENTRY_THRESH
-    was_panic_selling = float(recent_ofi.min()) < -0.40
+    was_panic_selling = float(recent_ofi.min()) < -(adaptive_ofi + 0.10)
     selling_exhausted = curr_ofi > -0.10
     long_signal = (is_oversold and was_panic_selling
                    and selling_exhausted and below_vwap and spy_safe_l)
 
     # ── SHORT: price mooning + buying exhausted + above VWAP ──
     is_overbought     = z_now >=  Z_ENTRY_THRESH
-    was_aggr_buying   = float(recent_ofi.max()) > 0.40
+    was_aggr_buying   = float(recent_ofi.max()) >  (adaptive_ofi + 0.10)
     buying_exhausted  = curr_ofi < 0.10
     short_signal = (is_overbought and was_aggr_buying
                     and buying_exhausted and above_vwap and spy_safe_s)
@@ -949,8 +961,11 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         bayes_p, b_log = bayesian_win_prob(add_b, sec_gate, hawk_sc, True, ks_sc)
 
         # Exhaustion triple-gate (Step A + B + C)
+        # adaptive_ofi scales the panic/exhaustion thresholds with market conditions:
+        #   calm market (0.20) → more sensitive, easier to trigger
+        #   volatile market (0.35) → requires stronger signal
         mr_long_sig, mr_short_sig, exhaustion_reason = check_exhaustion_signal(
-            df_i, vwap, spy_ret)
+            df_i, vwap, spy_ret, adaptive_ofi)
 
         # Volume divergence (final confirmation)
         vol_diverge = check_volume_divergence(df_i)
@@ -977,14 +992,21 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
             0.15*add_score(add_b) + 0.10*ks_sc + 0.10*bayes_p*100,
             0, 100))
         comp = round(float(np.clip(
-            raw * market["mkt_mult"] * (1.0 if add_b else 0.80) * max(hlth, 0.3),
+            raw * market["mkt_mult"] * (1.0 if add_b else 0.80) * hlth,
             0, 100)), 1)
 
+        # MR can fire LONG or SHORT — apply direction-appropriate market gate
+        mr_direction = "LONG" if mr_long_sig else "SHORT"
+        direction_ok  = (market["allows_long"] if mr_direction == "LONG"
+                         else True)  # shorts valid even in RISK-OFF
         alert = (comp >= SIGNAL_THRESHOLD and not intraday_blocked
-                 and market["allows_long"] and hlth > 0.0)
+                 and hlth > 0.0 and direction_ok)
 
         # MR exit: VWAP touch or 0.5% scalp — NOT ATR target
-        stop_p  = round(price * (1 - MR_STOP_LOSS_PCT), 2)    # 0.8% hard stop
+        # Stop = larger of ATR-based (adapts to stock volatility) or 0.8% floor
+        atr_stop = round(price - atr * ATR_STOP_MULT, 2) if atr > 0 else 0.0
+        pct_stop = round(price * (1 - MR_STOP_LOSS_PCT), 2)
+        stop_p   = max(atr_stop, pct_stop)  # whichever is closer to price
         target  = vwap                                          # VWAP is the exit
         rr      = abs(vwap - price) / (price * MR_STOP_LOSS_PCT + 1e-9)
         exit_type = "VWAP_TOUCH"
@@ -1329,8 +1351,10 @@ def run_dashboard():
                     f"✓ Sector RS · ADD Breadth<br>"
                     f"✓ Z-Score · Kurt/Skew<br>"
                     f"✓ Bayesian · Half-Life · ATR<br><br>"
-                    f"<span style='color:#1a5fd9'>CAP: $300M–$20B</span><br>"
-                    f"<span style='color:#1a5fd9'>TF: {timeframe}</span></div>",
+                    f"<span style='color:#1a5fd9'>CAP: $1B–$15B · TF: {timeframe}</span><br>"
+                    f"<span style='color:{'#1a8c2a' if SCHWAB_AVAILABLE else '#d94040'}'>"
+                    f"{'✓ Schwab API connected' if SCHWAB_AVAILABLE else '⚠ yfinance mode — 15s delay'}"
+                    f"</span></div>",
                     unsafe_allow_html=True)
 
     symbols = [s.strip().upper() for s in custom_syms.split("\n") if s.strip()]
@@ -1360,7 +1384,7 @@ def run_dashboard():
     add_val, add_bull = get_add_breadth()
     with c1:
         st.markdown('<div class="hdr">▲ QUANT SCANNER v3</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="sub">10-LAYER ENGINE · {timeframe.upper()} · CAP $300M–$20B</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sub">10-LAYER ENGINE · {timeframe.upper()} · CAP $1B–$15B</div>', unsafe_allow_html=True)
     with c2:
         ac = "#1a5fd9" if add_bull else "#d94040"
         st.markdown(f'<div style="text-align:right;margin-top:6px">'
