@@ -8,7 +8,7 @@ Deps:  pip install yfinance pandas numpy scipy streamlit openpyxl schedule
            Z-Score · Kurtosis/Skew · Bayesian Prob · Half-Life · ATR R:R
 
 Universe Scanner auto-runs at 9:00 AM EST daily.
-Cap filter: $1B–$15B. Timeframe: 15s / 1m / 5m / 15m toggle.
+Cap filter: $300M–$15B. Timeframe: 15s / 1m / 5m / 15m toggle.
 """
 
 import os, time, math, warnings, threading
@@ -96,7 +96,7 @@ UNIVERSE = list(dict.fromkeys([
 ]))
 
 # ── Thresholds ───────────────────────────────────────────────
-MIDCAP_MIN         = 1_000_000_000   # $1B minimum (liquid mid-caps only)
+MIDCAP_MIN         = 300_000_000    # $300M minimum — covers small/mid-cap watchlist
 MIDCAP_MAX         = 15_000_000_000  # $15B maximum
 ACCOUNT_SIZE       = float(os.environ.get("ACCOUNT_SIZE", 50000))
 SIGNAL_THRESHOLD   = 65
@@ -1088,7 +1088,7 @@ def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
         if not ok:
             reason = "BELOW_MIN_CAP" if mb < MIDCAP_MIN/1e9 else "ABOVE_MAX_CAP"
             rejected.append({"symbol":sym,"reason":reason,
-                             "detail":f"${mb:.2f}B (need $1B–$15B)"})
+                             "detail":f"${mb:.2f}B (need $300M–$15B)"})
         else:
             qualified.append(sym)
 
@@ -1445,7 +1445,7 @@ def run_dashboard():
                     f"✓ Sector RS · ADD Breadth<br>"
                     f"✓ Z-Score · Kurt/Skew<br>"
                     f"✓ Bayesian · Half-Life · ATR<br><br>"
-                    f"<span style='color:#1a5fd9'>CAP: $1B–$15B · TF: {timeframe}</span><br>"
+                    f"<span style='color:#1a5fd9'>CAP: $300M–$15B · TF: {timeframe}</span><br>"
                     f"<span style='color:{'#1a8c2a' if SCHWAB_AVAILABLE else '#d94040'}'>"
                     f"{'✓ Schwab connected' if SCHWAB_AVAILABLE else '⚠ yfinance only — 15s delay'}"
                     f"</span></div>",
@@ -1471,25 +1471,38 @@ def run_dashboard():
         st.session_state.update({"results":df,"market":market,
                                    "last_scan":now,"count":st.session_state["count"]+1})
 
-        # ── AUTO-EXPORT: save every scan automatically ────────
-        if not df.empty:
-            try:
-                # 1. Timestamped Excel snapshot (one file per scan)
-                export_excel(df, market)
+        # ── AUTO-EXPORT: runs every scan — even if 0 results ─────
+        try:
+            dl_dir   = os.path.join(os.path.expanduser("~"), "Downloads")
+            os.makedirs(dl_dir, exist_ok=True)
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
+            today     = datetime.now().strftime('%Y-%m-%d')
+            log_path  = os.path.join(dl_dir, f"scan_log_{today}.csv")
 
-                # 2. Cumulative daily CSV log (appends all day — never overwrites)
-                log_path = os.path.join(
-                    os.path.expanduser("~"), "Downloads",
-                    f"scan_log_{datetime.now().strftime('%Y-%m-%d')}.csv"
-                )
+            # 1. Excel snapshot (results + rejections + market context)
+            export_excel(df if not df.empty else pd.DataFrame(), market)
+
+            # 2. Append results to daily CSV log
+            if not df.empty:
                 df_log = df.copy()
                 df_log["scan_time"] = datetime.now().strftime("%H:%M:%S")
                 df_log["scan_num"]  = st.session_state["count"]
                 write_header = not os.path.exists(log_path)
                 df_log.to_csv(log_path, mode="a", header=write_header, index=False)
                 st.session_state["last_log_path"] = log_path
-            except Exception as e:
-                st.warning(f"⚠️ Auto-export failed: {e}")
+
+            # 3. Always write rejection log (separate file, appends all day)
+            rej = market.get("rejected_detail", [])
+            if rej:
+                rej_log = os.path.join(dl_dir, f"rejections_log_{today}.csv")
+                df_rej  = pd.DataFrame(rej)
+                df_rej["scan_time"] = datetime.now().strftime("%H:%M:%S")
+                df_rej["scan_num"]  = st.session_state["count"]
+                rej_header = not os.path.exists(rej_log)
+                df_rej.to_csv(rej_log, mode="a", header=rej_header, index=False)
+
+        except Exception as e:
+            st.warning(f"⚠️ Auto-export failed: {e}")
 
     df, market, count = st.session_state["results"], st.session_state["market"], st.session_state["count"]
 
@@ -1498,7 +1511,7 @@ def run_dashboard():
     add_val, add_bull = get_add_breadth()
     with c1:
         st.markdown('<div class="hdr">▲ QUANT SCANNER v3</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="sub">10-LAYER ENGINE · {timeframe.upper()} · CAP $1B–$15B</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sub">10-LAYER ENGINE · {timeframe.upper()} · CAP $300M–$15B</div>', unsafe_allow_html=True)
     with c2:
         ac = "#1a5fd9" if add_bull else "#d94040"
         st.markdown(f'<div style="text-align:right;margin-top:6px">'
@@ -1540,12 +1553,14 @@ def run_dashboard():
             + f'</div>', unsafe_allow_html=True)
 
     if df.empty:
-        st.info("No results — click ▶ RUN SCAN NOW")
-        time.sleep(refresh); st.rerun(); return
+        st.warning("⚠️ Scan returned 0 results — all symbols were filtered out. See rejection details below.")
+        # DO NOT return — fall through so rejected panel and export still render
 
-    # Alert banner
-    alerts = df[df["alert"] == True]
-    if not alerts.empty:
+    # ── Results sections (only when scan has results) ─────────
+    if not df.empty:
+      # Alert banner
+      alerts = df[df["alert"] == True]
+      if not alerts.empty:
         syms = "  ·  ".join(f"{r['symbol']} [{r['score']}] {r['bayes_prob']:.0f}%" for _,r in alerts.iterrows())
         st.markdown(
             f'<div style="background:#fffdf0;border:2px solid #f5c400;'
@@ -1815,7 +1830,7 @@ def run_dashboard():
             unsafe_allow_html=True
         )
 
-    # ── Rejected / Blocked Stocks ──────────────────────────────
+    # ── Rejected / Blocked Stocks (always visible) ────────────
     st.markdown("---")
     st.markdown("### 🚫 Rejected Stocks — Detailed Reasons")
     rejected_detail = market.get("rejected_detail", [])
@@ -1872,43 +1887,48 @@ def run_dashboard():
     else:
         st.info("No rejections recorded — run a scan first.")
 
-    # ── Export (Excel + CSV + Daily Log) ──────────────────────
+    # ── Export (always visible regardless of scan results) ────
     st.markdown("---")
     st.markdown("### 📥 Export")
 
-    # Auto-export status banner
     last_export = st.session_state.get('last_export_time', 'Never')
     last_log    = st.session_state.get('last_log_path', None)
     st.markdown(
         f"<div style='background:#f0f7ff;border:1px solid #1a5fd9;border-left:4px solid #1a5fd9;"
         f"border-radius:4px;padding:10px 14px;margin-bottom:12px;font-size:11px;"
         f"font-weight:600;color:#1a1a1a'>"
-        f"🔄 AUTO-EXPORT ACTIVE — every scan saves to ~/Downloads automatically<br>"
+        f"🔄 AUTO-EXPORT — every scan saves to ~/Downloads/  <br>"
         f"<span style='color:#666666;font-weight:400'>"
-        f"Excel snapshot per scan · Daily CSV log appends all day · "
-        f"Last export: {last_export}</span></div>",
+        f"📊 scan_YYYY-MM-DD_HHMM.xlsx (timestamped) &nbsp;·&nbsp; "
+        f"📊 scan_latest.xlsx (always current) &nbsp;·&nbsp; "
+        f"📋 scan_log_YYYY-MM-DD.csv (appends all day)<br>"
+        f"Last export: <b>{last_export}</b></span></div>",
         unsafe_allow_html=True
     )
 
     ec1, ec2, ec3, ec4 = st.columns(4)
 
     with ec1:
+        # Manual export trigger — works even if df is empty (exports rejected list)
         if st.button("📊 Export to Excel Now", use_container_width=True):
-            export_excel(df, market)
+            export_excel(df if not df.empty else pd.DataFrame(), market)
+            st.success("✅ Exported to ~/Downloads/")
 
     with ec2:
-        # Instant CSV download of current scan
-        csv_data = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📄 Download CSV",
-            data=csv_data,
-            file_name=f"scan_{datetime.now().strftime('%Y-%m-%d_%H%M')}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        if not df.empty:
+            csv_data = df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="📄 Download Results CSV",
+                data=csv_data,
+                file_name=f"scan_{datetime.now().strftime('%Y-%m-%d_%H%M')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.markdown("<div style='font-size:11px;color:#888888;padding-top:8px'>"
+                        "No scan results to download yet</div>", unsafe_allow_html=True)
 
     with ec3:
-        # Download the cumulative daily log if it exists
         if last_log and os.path.exists(last_log):
             with open(last_log, "rb") as f:
                 st.download_button(
@@ -1919,23 +1939,24 @@ def run_dashboard():
                     use_container_width=True,
                 )
         else:
-            st.markdown(
-                "<div style='font-size:11px;color:#888888;padding-top:8px'>"
-                "Daily log available after first scan</div>",
-                unsafe_allow_html=True)
+            st.markdown("<div style='font-size:11px;color:#888888;padding-top:8px'>"
+                        "Daily log builds after first successful scan</div>",
+                        unsafe_allow_html=True)
 
     with ec4:
-        # Rejected stocks CSV
-        rejected_detail = market.get("rejected_detail", [])
-        if rejected_detail:
-            rej_csv = pd.DataFrame(rejected_detail).to_csv(index=False).encode("utf-8")
+        rejected_detail_exp = market.get("rejected_detail", [])
+        if rejected_detail_exp:
+            rej_csv = pd.DataFrame(rejected_detail_exp).to_csv(index=False).encode("utf-8")
             st.download_button(
-                label="🚫 Download Rejections",
+                label=f"🚫 Download Rejections ({len(rejected_detail_exp)})",
                 data=rej_csv,
                 file_name=f"rejected_{datetime.now().strftime('%Y-%m-%d_%H%M')}.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
+        else:
+            st.markdown("<div style='font-size:11px;color:#888888;padding-top:8px'>"
+                        "No rejections recorded yet</div>", unsafe_allow_html=True)
 
     time.sleep(refresh)
     st.rerun()
