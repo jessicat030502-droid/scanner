@@ -31,9 +31,12 @@ except ImportError:
 
 try:
     import schwab
-    SCHWAB_AVAILABLE = True
-    # Schwab API ready — streaming will activate when credentials are set
-    # Set env vars: SCHWAB_API_KEY, SCHWAB_API_SECRET, SCHWAB_ACCOUNT_ID
+    # Only mark as available if credentials are actually set
+    _schwab_key    = os.environ.get("SCHWAB_API_KEY", "")
+    _schwab_secret = os.environ.get("SCHWAB_API_SECRET", "")
+    _schwab_acct   = os.environ.get("SCHWAB_ACCOUNT_ID", "")
+    SCHWAB_AVAILABLE = bool(_schwab_key and _schwab_secret and _schwab_acct)
+    # To connect: set SCHWAB_API_KEY, SCHWAB_API_SECRET, SCHWAB_ACCOUNT_ID env vars
 except ImportError:
     SCHWAB_AVAILABLE = False
     # Running in yfinance mode — all features work, data has 15s delay
@@ -1051,36 +1054,78 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
 def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
     """
     Parallel scan using ThreadPoolExecutor.
-    40 symbols: sequential ~40s → parallel ~6s (8 workers).
-    yfinance is I/O bound (network) so threading gives near-linear speedup.
+    Tracks FULL rejection reason for every blocked symbol so dashboard
+    can show exactly why each stock was filtered out.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    market  = get_market_regime()
-    results = []
-    blocked = []
+    market   = get_market_regime()
+    results  = []
+    rejected = []   # list of dicts: {symbol, reason, detail}
 
-    # Pre-check market cap sequentially (fast — uses cache)
+    # Pre-check market cap (fast — uses 1h cache)
     qualified = []
     for sym in symbols:
         ok, mb = is_midcap(sym)
-        if not ok: blocked.append(f"{sym}(${mb:.1f}B)")
-        else:      qualified.append(sym)
+        if not ok:
+            reason = "BELOW_MIN_CAP" if mb < MIDCAP_MIN/1e9 else "ABOVE_MAX_CAP"
+            rejected.append({"symbol":sym,"reason":reason,
+                             "detail":f"${mb:.2f}B (need $1B–$15B)"})
+        else:
+            qualified.append(sym)
 
-    # Parallel scan on qualified symbols
+    # Parallel scan — capture why each symbol was rejected inside scan_symbol
     def _scan_one(sym):
         try:
-            return scan_symbol(sym, market, timeframe)
+            # Run each firewall manually to get the specific rejection reason
+            df_d = fetch_daily(sym, 60)
+            if df_d is None or len(df_d) < 30:
+                return sym, None, "NO_DATA", "Insufficient daily bars"
+
+            liq_ok, liq_msg = passes_liquidity_firewall(df_d, sym)
+            if not liq_ok:
+                return sym, None, "LIQUIDITY", liq_msg
+
+            df_i = fetch_intraday(sym, timeframe) or df_d.copy()
+            spy_ret = market.get("spy_dev", 0.0) / 100.0
+
+            if STRATEGY_MODE == "AUTO":
+                strat, _, _, reg_reason = get_strategy_regime(df_i, spy_ret)
+            else:
+                strat = STRATEGY_MODE; reg_reason = f"FORCED_{STRATEGY_MODE}"
+
+            if strat == "NO_TRADE":
+                return sym, None, "NO_TRADE", reg_reason
+
+            etf = SECTOR_MAP.get(sym, "SPY")
+            _, _, sec_gate = get_sector_rs(etf)
+            if not sec_gate:
+                return sym, None, "SECTOR_RS", f"{etf} RS < 1.05 (sector lagging SPY)"
+
+            r = scan_symbol(sym, market, timeframe)
+            if r:
+                return sym, r, None, None
+            else:
+                return sym, None, "SCAN_FAILED", "Returned None (likely intraday health block)"
         except Exception as e:
-            print(f"[ERR] {sym}: {e}")
-            return None
+            return sym, None, "ERROR", str(e)
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(_scan_one, sym): sym for sym in qualified}
         for fut in as_completed(futures):
-            r = fut.result()
-            if r: results.append(r)
+            sym, r, reason, detail = fut.result()
+            if r:
+                results.append(r)
+            elif reason:
+                rejected.append({"symbol":sym,"reason":reason,"detail":detail or ""})
 
-    market.update({"blocked":blocked,"blocked_count":len(blocked),"scanned":len(results)})
+    # Build simple blocked list for backward compat + rich rejected list
+    blocked_simple = [f"{r['symbol']}({r['reason']})" for r in rejected]
+    market.update({
+        "blocked":        blocked_simple,
+        "blocked_count":  len(rejected),
+        "scanned":        len(results),
+        "rejected_detail":rejected,   # full detail for dashboard
+    })
     if not results: return pd.DataFrame(), market
     return pd.DataFrame(results).sort_values(by=["score","bayes_prob"],
                                               ascending=False).reset_index(drop=True), market
@@ -1353,7 +1398,7 @@ def run_dashboard():
                     f"✓ Bayesian · Half-Life · ATR<br><br>"
                     f"<span style='color:#1a5fd9'>CAP: $1B–$15B · TF: {timeframe}</span><br>"
                     f"<span style='color:{'#1a8c2a' if SCHWAB_AVAILABLE else '#d94040'}'>"
-                    f"{'✓ Schwab API connected' if SCHWAB_AVAILABLE else '⚠ yfinance mode — 15s delay'}"
+                    f"{'✓ Schwab connected' if SCHWAB_AVAILABLE else '⚠ yfinance only — 15s delay'}"
                     f"</span></div>",
                     unsafe_allow_html=True)
 
@@ -1400,7 +1445,7 @@ def run_dashboard():
         st.markdown(
             f'<div style="font-size:12px;font-weight:600;color:#444444;'
             f'letter-spacing:2px;margin-bottom:14px;text-transform:uppercase;'
-            f'border-bottom:1px solid #1e1a08;padding-bottom:8px">'
+            f'border-bottom:1px solid #e0e0e0;padding-bottom:8px">'
             f'MARKET: <span style="color:{rc}">{market.get("regime","—")}</span>'
             f'&nbsp;&nbsp;|&nbsp;&nbsp;SPY {market.get("spy_price","—")} '
             f'<span style="color:{"#1a8c2a" if market.get("spy_dev",0)>0 else "#d94040"}">'
@@ -1409,8 +1454,21 @@ def run_dashboard():
             f'<span style="color:{"#1a8c2a" if market.get("qqq_dev",0)>0 else "#d94040"}">'
             f'({market.get("qqq_dev",0):+.2f}%)</span>'
             f'&nbsp;&nbsp;|&nbsp;&nbsp;✅ {market.get("scanned",0)} SCANNED'
-            f'{"&nbsp;&nbsp;🚫 "+str(market["blocked_count"])+" BLOCKED" if market.get("blocked_count",0)>0 else ""}'
-            f'</div>', unsafe_allow_html=True)
+            + (
+                (lambda rej: (
+                    f'&nbsp;&nbsp;🚫 {len(rej)} BLOCKED'
+                    + (lambda groups: "".join(
+                        f'&nbsp;<span style="color:#888888;font-size:10px">'
+                        f'[{k}×{v}]</span>'
+                        for k,v in groups.items()
+                    ))(
+                        {r["reason"]: sum(1 for x in rej if x["reason"]==r["reason"])
+                         for r in rej}
+                    )
+                ))(market.get("rejected_detail",[]))
+                if market.get("blocked_count",0) > 0 else ""
+            )
+            + f'</div>', unsafe_allow_html=True)
 
     if df.empty:
         st.info("No results — click ▶ RUN SCAN NOW")
@@ -1596,21 +1654,104 @@ def run_dashboard():
     # ── Full Results Table ─────────────────────────────────────
     st.markdown("---")
     st.markdown("### 📊 Full Scan Results")
-    show = ["symbol","score","bayes_prob","zscore","kurtosis","skewness","ks_label",
-            "hurst_regime","hawkes_sig","ofi_sig","sector_etf","add_bull",
-            "rr_ok","kelly_frac","shares","stop","target","health_label","mcap_b"]
+    show = ["symbol","score","bayes_prob","strategy","adx","zscore","kurtosis","skewness",
+            "ks_label","hurst_regime","hawkes_sig","ofi_sig","sector_etf","add_bull",
+            "rr_ok","kelly_frac","shares","stop","target","vwap","health_label","mcap_b"]
     st.dataframe(df[[c for c in show if c in df.columns]], use_container_width=True, hide_index=True)
 
-    # ── Export ─────────────────────────────────────────────────
+    # ── Rejected / Blocked Stocks ──────────────────────────────
     st.markdown("---")
-    ec1, ec2 = st.columns(2)
+    st.markdown("### 🚫 Rejected Stocks — Detailed Reasons")
+    rejected_detail = market.get("rejected_detail", [])
+    if rejected_detail:
+        # Colour-code by rejection reason
+        reason_colour = {
+            "BELOW_MIN_CAP":  "#888888",
+            "ABOVE_MAX_CAP":  "#888888",
+            "NO_DATA":        "#d94040",
+            "LIQUIDITY":      "#d94040",
+            "NO_TRADE":       "#b08800",
+            "SECTOR_RS":      "#1a5fd9",
+            "SCAN_FAILED":    "#d94040",
+            "ERROR":          "#d94040",
+        }
+        reason_label = {
+            "BELOW_MIN_CAP": "Cap too small",
+            "ABOVE_MAX_CAP": "Cap too large",
+            "NO_DATA":       "No data",
+            "LIQUIDITY":     "Liquidity fail",
+            "NO_TRADE":      "Regime no-trade",
+            "SECTOR_RS":     "Sector RS fail",
+            "SCAN_FAILED":   "Health/intraday block",
+            "ERROR":         "Error",
+        }
+        # Group by reason
+        from collections import defaultdict
+        by_reason = defaultdict(list)
+        for r in rejected_detail:
+            by_reason[r["reason"]].append(r)
+
+        cols_rej = st.columns(min(4, len(by_reason)))
+        for i, (reason, items) in enumerate(sorted(by_reason.items())):
+            col = cols_rej[i % len(cols_rej)]
+            colour = reason_colour.get(reason, "#888888")
+            label  = reason_label.get(reason, reason)
+            rows   = "".join(
+                f"<div style='padding:3px 0;border-bottom:1px solid #f0f0f0;font-size:11px;"
+                f"font-weight:600;color:#1a1a1a'>{r['symbol']}"
+                f"<span style='font-size:10px;font-weight:400;color:#666666;margin-left:6px'>"
+                f"{r['detail']}</span></div>"
+                for r in items
+            )
+            col.markdown(
+                f"<div style='border:1px solid {colour};border-left:4px solid {colour};"
+                f"border-radius:4px;padding:10px 12px;background:#ffffff;"
+                f"box-shadow:0 1px 3px rgba(0,0,0,0.06)'>"
+                f"<div style='font-size:11px;font-weight:800;color:{colour};"
+                f"text-transform:uppercase;letter-spacing:1px;margin-bottom:6px'>"
+                f"{label} ({len(items)})</div>"
+                f"{rows}</div>",
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("No rejections recorded — run a scan first.")
+
+    # ── Export (Excel + CSV) ───────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📥 Export")
+    ec1, ec2, ec3 = st.columns(3)
+
     with ec1:
-        if st.button("📥 Export to Excel"): export_excel(df, market)
+        if st.button("📊 Export to Excel"):
+            export_excel(df, market)
+
     with ec2:
-        st.markdown(f"<div style='font-size:11px;font-weight:600;color:#888888;"
-                    f"padding-top:8px;text-transform:uppercase;letter-spacing:1px'>"
-                    f"Last export: {st.session_state.get('last_export_time','Never')}</div>",
-                    unsafe_allow_html=True)
+        # CSV export — always available, no file system needed
+        csv_data = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="📄 Download CSV",
+            data=csv_data,
+            file_name=f"scan_{datetime.now().strftime('%Y-%m-%d_%H%M')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with ec3:
+        # Rejected stocks as CSV
+        if rejected_detail:
+            rej_csv = pd.DataFrame(rejected_detail).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="🚫 Download Rejections CSV",
+                data=rej_csv,
+                file_name=f"rejected_{datetime.now().strftime('%Y-%m-%d_%H%M')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        st.markdown(
+            f"<div style='font-size:11px;font-weight:600;color:#888888;"
+            f"padding-top:8px;text-transform:uppercase;letter-spacing:1px'>"
+            f"Last Excel: {st.session_state.get('last_export_time','Never')}</div>",
+            unsafe_allow_html=True)
 
     time.sleep(refresh)
     st.rerun()
