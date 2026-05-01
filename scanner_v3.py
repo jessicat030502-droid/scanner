@@ -1,14 +1,24 @@
 """
-QUANT SCANNER v3 — Mid/Small Cap Day Trading Engine
-=====================================================
-Run:   python -m streamlit run scanner_v3.py
-Deps:  pip install yfinance pandas numpy scipy streamlit openpyxl schedule
+QUANT SCANNER v4 - Mid/Small Cap + Russell 2000 Day Trading Engine
+===================================================================
+Run:   python -m streamlit run scanner_v4.py
+Deps:  pip install yfinance pandas numpy scipy streamlit openpyxl schedule colorama
 
-10 Layers: Hurst · Hawkes · OFI · Sector RS · ADD Breadth ·
-           Z-Score · Kurtosis/Skew · Bayesian Prob · Half-Life · ATR R:R
+10 Layers: Hurst | Hawkes | OFI | Sector RS | ADD Breadth ·
+           Z-Score | Kurtosis/Skew | Bayesian Prob | Half-Life | ATR R:R
 
-Universe Scanner auto-runs at 9:00 AM EST daily.
-Cap filter: $300M–$15B. Timeframe: 15s / 1m / 5m / 15m toggle.
+New in v4:
+  - Russell 2000 full universe scan (2000 stocks, batched)
+  - Range Filter confirmation gate (ThinkScript port)
+  - Ticker personality profiling (per-symbol win rate tracking)
+  - Backtest + sensitivity analysis module
+  - TWAP/VWAP execution schedule
+  - Portfolio risk controls (max 5 positions, max 2/sector)
+  - Validate-before-execute pre-trade layer
+  - EOD exit 3:30/3:55 PM
+  - Single daily Excel workbook (all scans in one file)
+
+Cap filter: $300M-$20B. Timeframe: 15s / 1m / 5m / 15m toggle.
 """
 
 import os, time, math, warnings, threading
@@ -39,7 +49,7 @@ try:
     # To connect: set SCHWAB_API_KEY, SCHWAB_API_SECRET, SCHWAB_ACCOUNT_ID env vars
 except ImportError:
     SCHWAB_AVAILABLE = False
-    # Running in yfinance mode — all features work, data has 15s delay
+    # Running in yfinance mode - all features work, data has 15s delay
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -96,14 +106,14 @@ UNIVERSE = list(dict.fromkeys([
 ]))
 
 # ── Universe Mode ────────────────────────────────────────────
-# WATCHLIST:   40-stock curated list   — fast, manual picks
-# RUSSELL2000: Full IWM constituent list ~2000 stocks — more signals, more noise
+# WATCHLIST:   40-stock curated list   - fast, manual picks
+# RUSSELL2000: Full IWM constituent list ~2000 stocks - more signals, more noise
 # Set UNIVERSE_MODE to switch. Russell 2000 requires stricter firewalls.
 UNIVERSE_MODE      = "WATCHLIST"     # "WATCHLIST" | "RUSSELL2000"
 
 # ── Thresholds ───────────────────────────────────────────────
-MIDCAP_MIN         = 300_000_000    # $300M — covers small/mid-cap watchlist
-MIDCAP_MAX         = 15_000_000_000  # $15B max
+MIDCAP_MIN         = 300_000_000    # $300M - covers small/mid-cap watchlist
+MIDCAP_MAX         = 20_000_000_000  # $20B max - covers R2K growers ($15B was too tight)
 ACCOUNT_SIZE       = float(os.environ.get("ACCOUNT_SIZE", 50000))
 SIGNAL_THRESHOLD   = 65
 ATR_STOP_MULT      = 1.5
@@ -139,7 +149,7 @@ MIN_DOLLAR_VOLUME  = 5_000_000       # $5M default (watchlist)
 MIN_REL_VOLUME     = 1.2             # 1.2x default
 
 # ── Russell 2000 Stricter Thresholds ─────────────────────────
-R2K_MIN_DOLLAR_VOLUME = 20_000_000  # $20M — doc spec §7: "$20M+ for execution"
+R2K_MIN_DOLLAR_VOLUME = 20_000_000  # $20M - doc spec §7: "$20M+ for execution"
 R2K_MIN_REL_VOLUME    = 1.5         # 1.5x
 R2K_SIGNAL_THRESHOLD  = 72          # "Best of best" from 2000 stocks
 R2K_HURST_MIN         = 0.55        # Clean trend required
@@ -149,24 +159,24 @@ R2K_BATCH_SIZE        = 500         # Rate limit protection
 R2K_RF_LENGTH         = 25          # Adaptive base for small-cap speed
 
 # ── Portfolio Risk Controls (§8) ─────────────────────────────
-MAX_OPEN_POSITIONS    = 5            # Hard cap — prevents overtrading
+MAX_OPEN_POSITIONS    = 5            # Hard cap - prevents overtrading
 MAX_SECTOR_POSITIONS  = 2            # Max 2 per sector at once
 MAX_TOTAL_RISK_PCT    = 0.05         # Max 5% of account in open risk
 
 # ── Execution Rules ───────────────────────────────────────────
 LIMIT_ORDERS_ONLY     = True         # §12: never use market orders
-MAX_TRADES_PER_DAY    = 20           # §12: slippage accumulates — cap daily trades
+MAX_TRADES_PER_DAY    = 20           # §12: slippage accumulates - cap daily trades
 
 # ── Exit Rules ───────────────────────────────────────────────
 PARTIAL_TP_PCT        = 0.50         # §13: take 50% off at first target
-EOD_SOFT_EXIT_HOUR    = 15           # 3:00 PM — begin closing
+EOD_SOFT_EXIT_HOUR    = 15           # 3:00 PM - begin closing
 EOD_SOFT_EXIT_MIN     = 30           # 3:30 PM soft exit
 EOD_HARD_EXIT_HOUR    = 15           # 3:55 PM hard exit all
 EOD_HARD_EXIT_MIN     = 55
 
 # ── Half-Life Minimums (§6) ───────────────────────────────────
-HALFLIFE_MIN_REMAINING_SCALP    = 30   # seconds — reject if < 30s for scalps
-HALFLIFE_MIN_REMAINING_INTRADAY = 120  # seconds — reject if < 2min for intraday
+HALFLIFE_MIN_REMAINING_SCALP    = 30   # seconds - reject if < 30s for scalps
+HALFLIFE_MIN_REMAINING_INTRADAY = 120  # seconds - reject if < 2min for intraday
 
 # ── Global Controls ───────────────────────────────────────────
 GLOBAL_KILL_SWITCH    = False        # §10: set True to halt all new entries
@@ -194,13 +204,13 @@ SPY_VOL_NORMAL     = 0.010
 
 def compute_range_filter(prices: np.ndarray, length: int = 25) -> tuple:
     """
-    Range Filter — ported from ThinkScript.
+    Range Filter - ported from ThinkScript.
     Returns (filter_val, upward, downward, signal_up, signal_down).
 
     signal_up   = True when price crosses above filter AND trend is up
     signal_down = True when price crosses below filter AND trend is down
 
-    length=25 for Russell 2000 (was 100 in TOS — too slow for small-caps)
+    length=25 for Russell 2000 (was 100 in TOS - too slow for small-caps)
     length=30 for 5-min chart, length=20 for 1-min chart
 
     ThinkScript logic:
@@ -280,22 +290,22 @@ def is_trading_allowed() -> tuple:
       - Past EOD hard exit time
     """
     if GLOBAL_KILL_SWITCH:
-        return False, "GLOBAL_KILL_SWITCH=True — all entries halted"
+        return False, "GLOBAL_KILL_SWITCH=True - all entries halted"
 
     now = datetime.now()
     # Before market open
     if now.hour < 9 or (now.hour == 9 and now.minute < 30):
-        return False, "PRE_MARKET — no entries before 9:30 AM"
+        return False, "PRE_MARKET - no entries before 9:30 AM"
     # Hard EOD exit
     if now.hour > EOD_HARD_EXIT_HOUR or \
        (now.hour == EOD_HARD_EXIT_HOUR and now.minute >= EOD_HARD_EXIT_MIN):
-        return False, f"EOD_HARD_EXIT — past {EOD_HARD_EXIT_HOUR}:{EOD_HARD_EXIT_MIN:02d} PM"
+        return False, f"EOD_HARD_EXIT - past {EOD_HARD_EXIT_HOUR}:{EOD_HARD_EXIT_MIN:02d} PM"
 
     return True, "OK"
 
 
 def is_eod_soft_exit() -> bool:
-    """True between 3:30 PM and 3:55 PM — close winners, no new entries."""
+    """True between 3:30 PM and 3:55 PM - close winners, no new entries."""
     now = datetime.now()
     soft = now.hour == EOD_SOFT_EXIT_HOUR and now.minute >= EOD_SOFT_EXIT_MIN
     hard = now.hour == EOD_HARD_EXIT_HOUR and now.minute >= EOD_HARD_EXIT_MIN
@@ -340,7 +350,7 @@ def portfolio_allows_entry(symbol: str, sector_etf: str,
     if risk_pct >= MAX_TOTAL_RISK_PCT:
         return False, f"MAX_RISK: {risk_pct:.1%} of account at risk (max {MAX_TOTAL_RISK_PCT:.0%})"
 
-    return True, f"OK — {len(open_pos)} open, {sector_count} in {sector_etf}, {risk_pct:.1%} at risk"
+    return True, f"OK - {len(open_pos)} open, {sector_count} in {sector_etf}, {risk_pct:.1%} at risk"
 
 
 # ── Pre-Trade Validation Layer (§2.2) ────────────────────────────────────────
@@ -366,7 +376,7 @@ def validate_before_execute(result: dict, current_price: float,
     hl_alive   = bool(result.get("hl_alive", False))
     hl_rem     = float(result.get("hl_remaining", 0))
     rf_confirms= bool(result.get("rf_confirms", False))
-    strategy   = result.get("strategy","—")
+    strategy   = result.get("strategy","--")
     sector_etf = result.get("sector_etf","SPY")
 
     # 1. Global gate
@@ -374,13 +384,13 @@ def validate_before_execute(result: dict, current_price: float,
     if not allowed:
         return False, reason
 
-    # 2. Half-life minimum — choose threshold based on mode
+    # 2. Half-life minimum - choose threshold based on mode
     min_hl = (HALFLIFE_MIN_REMAINING_SCALP if UNIVERSE_MODE == "RUSSELL2000"
               else HALFLIFE_MIN_REMAINING_INTRADAY)
     if not hl_alive or hl_rem < min_hl:
         return False, f"SIGNAL_EXPIRED: {hl_rem:.0f}s remaining (min {min_hl}s)"
 
-    # 3. Price drift — reject if moved more than 0.5% from signal
+    # 3. Price drift - reject if moved more than 0.5% from signal
     if signal_px > 0:
         drift = abs(current_price - signal_px) / signal_px
         if drift > 0.005:
@@ -399,17 +409,17 @@ def validate_before_execute(result: dict, current_price: float,
     if not port_ok:
         return False, port_reason
 
-    return True, f"VALID — hl={hl_rem:.0f}s drift={abs(current_price-signal_px)/signal_px*100:.2f}%"
+    return True, f"VALID - hl={hl_rem:.0f}s drift={abs(current_price-signal_px)/signal_px*100:.2f}%"
 
 
 # ── Adaptive Range Filter Length (§5.1) ──────────────────────────────────────
 
 def adaptive_rf_length(atr_pct: float, universe: str = "WATCHLIST") -> int:
     """
-    §5.1: RF length must adapt to volatility — not static.
+    §5.1: RF length must adapt to volatility - not static.
 
-    High volatility:  shorter length (20–30) → more responsive
-    Low volatility:   longer length (40–60)  → filters more noise
+    High volatility:  shorter length (20-30) -> more responsive
+    Low volatility:   longer length (40-60)  -> filters more noise
 
     atr_pct: ATR as % of price (e.g., 0.025 = 2.5%)
     """
@@ -434,7 +444,7 @@ def rank_signals(df: pd.DataFrame, top_n: int = 10,
     Replace with relative ranking:
       - top_n:   return best N results regardless of absolute score
       - top_pct: return top X% of all scanned (e.g., top 5%)
-    Both filters applied — stricter of the two wins.
+    Both filters applied - stricter of the two wins.
 
     Also adds a 'rank' and 'percentile' column to the DataFrame.
     """
@@ -459,8 +469,8 @@ def determine_exit_with_partial(current_price: float, entry_price: float,
                                   shares_remaining: int) -> tuple:
     """
     §13: Two-stage exit:
-      Stage 1 — Take 50% off at first target (VWAP touch or 0.5% TP)
-      Stage 2 — Trail remaining 50% until hard stop or 0.8% TP
+      Stage 1 - Take 50% off at first target (VWAP touch or 0.5% TP)
+      Stage 2 - Trail remaining 50% until hard stop or 0.8% TP
 
     Returns (action: str, shares_to_close: int, reason: str).
     Actions: "PARTIAL_EXIT" | "FULL_EXIT" | "HOLD"
@@ -498,8 +508,8 @@ def determine_exit_with_partial(current_price: float, entry_price: float,
 
 def check_eod_exit(positions: dict) -> list:
     """
-    §13: End-of-day exit — eliminates overnight risk.
-    3:30–3:55 PM: close winning positions first (soft exit)
+    §13: End-of-day exit - eliminates overnight risk.
+    3:30-3:55 PM: close winning positions first (soft exit)
     3:55 PM+:     close everything hard (hard exit)
 
     Returns list of symbols to close with reason.
@@ -516,9 +526,9 @@ def check_eod_exit(positions: dict) -> list:
         if pos.direction == "FLAT":
             continue
         if hard:
-            to_close.append((sym, "EOD_HARD_EXIT — 3:55 PM all positions closed"))
+            to_close.append((sym, "EOD_HARD_EXIT - 3:55 PM all positions closed"))
         elif soft and pos.pnl > 0:
-            to_close.append((sym, f"EOD_SOFT_EXIT — closing winner ${pos.pnl:+.2f}"))
+            to_close.append((sym, f"EOD_SOFT_EXIT - closing winner ${pos.pnl:+.2f}"))
 
     return to_close
 
@@ -675,15 +685,15 @@ def bayesian_win_prob(add_bull: bool, sector_ok: bool,
     def upd(cond, boost, label):
         nonlocal p
         p = float(np.clip(p + (boost if cond else -boost * 0.5), 0.03, 0.97))
-        log.append(f"{label} → {p:.0%}")
+        log.append(f"{label} -> {p:.0%}")
 
     upd(add_bull,         BAYES_ADD,    f"ADD {'↑' if add_bull else '↓'}")
     upd(sector_ok,        BAYES_SECTOR, f"Sector {'✓' if sector_ok else '✗'}")
-    upd(hawk_sc >= 72,    BAYES_HAWKES, f"Hawkes {'🔥' if hawk_sc>=72 else '⚡' if hawk_sc>=58 else '—'}")
+    upd(hawk_sc >= 72,    BAYES_HAWKES, f"Hawkes {'🔥' if hawk_sc>=72 else '⚡' if hawk_sc>=58 else '--'}")
     upd(z_ok,             0.04,         f"Z {'✓' if z_ok else '✗'}")
     if ks_sc >= 60:
         p = float(np.clip(p + 0.05, 0.03, 0.97))
-        log.append(f"FatTail → {p:.0%}")
+        log.append(f"FatTail -> {p:.0%}")
 
     return round(p, 4), log
 
@@ -827,18 +837,18 @@ def compute_atr(df: pd.DataFrame, n: int = 14) -> float:
 
 def intraday_health(df: pd.DataFrame, prior_close: float) -> tuple:
     """
-    Hard intraday momentum gate — fixes the CRUS problem.
+    Hard intraday momentum gate - fixes the CRUS problem.
 
     HARD BLOCKS (mult = 0.0, alert = False):
-      - Price below VWAP                     → institutions net sellers, never long here
-      - Intraday return <= -3% from open     → confirmed selloff
-      - Gap down > 2% from prior close       → gap-down continuation risk
+      - Price below VWAP                     -> institutions net sellers, never long here
+      - Intraday return <= -3% from open     -> confirmed selloff
+      - Gap down > 2% from prior close       -> gap-down continuation risk
 
     SOFT PENALTIES (score multiplier):
-      - Intraday -2% to -3%                  → 50% penalty
-      - Intraday -1% to -2%                  → 25% penalty
-      - Gap down 1-2%                        → 15% penalty
-      - Lower lows on last 6 bars            → 30% penalty
+      - Intraday -2% to -3%                  -> 50% penalty
+      - Intraday -1% to -2%                  -> 25% penalty
+      - Gap down 1-2%                        -> 15% penalty
+      - Lower lows on last 6 bars            -> 30% penalty
     """
     if df is None or len(df) < 5: return 1.0, "NO DATA", {}
     try:
@@ -861,11 +871,11 @@ def intraday_health(df: pd.DataFrame, prior_close: float) -> tuple:
 
     mult, flags, hard_blocked = 1.0, [], False
 
-    # ── HARD BLOCKS — only extreme conditions kill signal entirely ──
+    # ── HARD BLOCKS - only extreme conditions kill signal entirely ──
     # NOTE: below_vwap is NO LONGER a hard block because:
     #   - MR LONG entries REQUIRE price below VWAP (it's the setup condition)
     #   - Hard blocking below_vwap was preventing every valid MR long from showing
-    # Instead: score penalty — the MR exhaustion gate enforces VWAP side correctly
+    # Instead: score penalty - the MR exhaustion gate enforces VWAP side correctly
 
     if intra_r <= INTRADAY_KILL:
         mult = 0.0; hard_blocked = True
@@ -880,7 +890,7 @@ def intraday_health(df: pd.DataFrame, prior_close: float) -> tuple:
         mult *= 0.75
         flags.append(f"BELOW_VWAP${vwap:.2f}")
 
-    # ── SOFT PENALTIES — only if not already hard blocked ────
+    # ── SOFT PENALTIES - only if not already hard blocked ────
     if not hard_blocked:
         if gap_r    < GAP_DOWN_THRESH: mult *= 0.85; flags.append(f"GAP↓{gap_r*100:.1f}%")
         if intra_r <= INTRADAY_HARD:   mult *= 0.50;  flags.append(f"WEAK{intra_r*100:.1f}%")
@@ -979,9 +989,9 @@ def passes_liquidity_firewall(df_d: pd.DataFrame, symbol: str) -> tuple:
 
 def compute_adx(df: pd.DataFrame, n: int = 14) -> float:
     """
-    Average Directional Index — fully vectorized with pandas.
-    Replaces the Python-loop Wilder smoother with ewm() — 5-10x faster.
-    Returns float 0–100. Default 20.0 (neutral/ranging) on bad data.
+    Average Directional Index - fully vectorized with pandas.
+    Replaces the Python-loop Wilder smoother with ewm() - 5-10x faster.
+    Returns float 0-100. Default 20.0 (neutral/ranging) on bad data.
     """
     if df is None or len(df) < n * 2:
         return 20.0
@@ -995,7 +1005,7 @@ def compute_adx(df: pd.DataFrame, n: int = 14) -> float:
     pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=h.index)
     ndm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=h.index)
 
-    # Wilder smoothing via ewm (alpha = 1/n) — replaces the Python loop
+    # Wilder smoothing via ewm (alpha = 1/n) - replaces the Python loop
     alpha  = 1.0 / n
     atr_s  = tr.ewm(alpha=alpha,  adjust=False).mean()
     pdi_s  = pdm.ewm(alpha=alpha, adjust=False).mean()
@@ -1022,15 +1032,15 @@ def get_strategy_regime(df_intra: pd.DataFrame, spy_return: float) -> tuple:
     Returns (strategy: str, adaptive_ofi: float, adx: float, reason: str).
 
     Decision tree:
-      SPY move > 1.5%          → NO_TRADE (too volatile for either strategy)
-      ADX > ADX_MAX (25)       → TREND (runaway trend, only momentum valid)
-      SPY calm + ADX < 25      → MEAN_REVERSION (ranging market, fading valid)
-      In between               → TREND (default to safer momentum strategy)
+      SPY move > 1.5%          -> NO_TRADE (too volatile for either strategy)
+      ADX > ADX_MAX (25)       -> TREND (runaway trend, only momentum valid)
+      SPY calm + ADX < 25      -> MEAN_REVERSION (ranging market, fading valid)
+      In between               -> TREND (default to safer momentum strategy)
 
     Adaptive OFI threshold scales with volatility:
-      Calm  (SPY < 0.5%): 0.20 — more sensitive to small imbalances
-      Normal(SPY < 1.0%): 0.30 — standard
-      Hot   (SPY < 1.5%): 0.35 — require stronger signal before entry
+      Calm  (SPY < 0.5%): 0.20 - more sensitive to small imbalances
+      Normal(SPY < 1.0%): 0.30 - standard
+      Hot   (SPY < 1.5%): 0.35 - require stronger signal before entry
     """
     adx      = compute_adx(df_intra)
     spy_vol  = abs(spy_return)
@@ -1067,14 +1077,14 @@ def check_exhaustion_signal(df: pd.DataFrame, vwap: float,
                              adaptive_ofi: float = 0.30) -> tuple:
     """
     Three-step exhaustion confirmation:
-      Step A — Extension:  Z-score >= 2.0 (price far from mean)
-      Step B — Exhaustion: OFI spiked then faded (ammunition depleted)
-      Step C — VWAP side:  Price on correct side for reversion
+      Step A - Extension:  Z-score >= 2.0 (price far from mean)
+      Step B - Exhaustion: OFI spiked then faded (ammunition depleted)
+      Step C - VWAP side:  Price on correct side for reversion
 
     adaptive_ofi scales panic/exhaustion thresholds with market regime:
-      0.20 = calm  → easier trigger (more sensitive)
+      0.20 = calm  -> easier trigger (more sensitive)
       0.30 = normal
-      0.35 = volatile → harder trigger (requires stronger signal)
+      0.35 = volatile -> harder trigger (requires stronger signal)
 
     Returns (long_signal: bool, short_signal: bool, reason: str).
     """
@@ -1131,7 +1141,7 @@ def check_exhaustion_signal(df: pd.DataFrame, vwap: float,
 
 # ── Volume Divergence Filter ──────────────────────────────────────────────────
 # Final confirmation: price hitting extreme but volume drying up = no fuel left.
-# This confirms the exhaustion signal — move can't continue without volume.
+# This confirms the exhaustion signal - move can't continue without volume.
 
 def check_volume_divergence(df: pd.DataFrame) -> bool:
     """
@@ -1151,8 +1161,8 @@ def check_volume_divergence(df: pd.DataFrame) -> bool:
 
 
 # ── Mean Reversion Exit Engine ────────────────────────────────────────────────
-# For MEAN_REVERSION mode: small scalp target OR VWAP touch — whichever first.
-# This is what drives the high win rate — take the easy money, don't be greedy.
+# For MEAN_REVERSION mode: small scalp target OR VWAP touch - whichever first.
+# This is what drives the high win rate - take the easy money, don't be greedy.
 
 def determine_mr_exit(current_price: float, entry_price: float,
                       vwap: float, side: str) -> str:
@@ -1224,16 +1234,16 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
     Dual-strategy scanner with hard strategy switch.
 
     STRATEGY_MODE (global config):
-      AUTO         → ADX + SPY vol determines strategy each scan
-      TREND        → Hurst + Hawkes momentum (volatile/trending markets)
-      MEAN_REVERSION → Exhaustion triple-gate + VWAP exit (ranging markets)
+      AUTO         -> ADX + SPY vol determines strategy each scan
+      TREND        -> Hurst + Hawkes momentum (volatile/trending markets)
+      MEAN_REVERSION -> Exhaustion triple-gate + VWAP exit (ranging markets)
 
     CRITICAL: Only ONE strategy fires per scan. Never both simultaneously.
     If strategy = NO_TRADE, returns None immediately.
 
-    mode = "premarket"  → 9:00 AM build watchlist (daily Hurst, soft gates)
-    mode = "intraday"   → market hours confirmation (hard gates, dual Hurst)
-    mode = "auto"       → auto-detects from clock
+    mode = "premarket"  -> 9:00 AM build watchlist (daily Hurst, soft gates)
+    mode = "intraday"   -> market hours confirmation (hard gates, dual Hurst)
+    mode = "auto"       -> auto-detects from clock
     """
     if mode == "auto":
         hour = datetime.now().hour
@@ -1270,15 +1280,15 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         strategy, adaptive_ofi, adx_val, regime_reason = "MEAN_REVERSION", 0.30, compute_adx(df_i), "FORCED_MR"
 
     if strategy == "NO_TRADE":
-        return None   # Market too volatile — kill scan entirely
+        return None   # Market too volatile - kill scan entirely
 
     # ── FIREWALL 5: Sector RS (updated to 1.05) ───────────────
     etf                      = SECTOR_MAP.get(symbol, "SPY")
     sec_rs, sec_sc, sec_gate = get_sector_rs(etf)
     # Sector RS: hard block only if completely failing (< 0.97 = sector badly lagging)
-    # Between 0.97–1.01: soft penalty applied in composite score — still scanned
+    # Between 0.97-1.01: soft penalty applied in composite score - still scanned
     if sec_rs < 0.97:
-        return None  # Sector is actively dragging — hard block
+        return None  # Sector is actively dragging - hard block
 
     # ── Core calculations (shared by both strategies) ─────────
     H_daily              = compute_hurst(closes)
@@ -1291,7 +1301,7 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
     kurt, skew           = compute_kurtosis_skew(closes)
     hlth, hlbl, hd       = intraday_health(df_i, prior_close)
 
-    # ── STRATEGY BRANCH — exactly one fires ───────────────────
+    # ── STRATEGY BRANCH - exactly one fires ───────────────────
 
     if strategy == "TREND":
         # TREND MODE: Hurst + Hawkes + momentum OFI
@@ -1348,8 +1358,8 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
 
         # Exhaustion triple-gate (Step A + B + C)
         # adaptive_ofi scales the panic/exhaustion thresholds with market conditions:
-        #   calm market (0.20) → more sensitive, easier to trigger
-        #   volatile market (0.35) → requires stronger signal
+        #   calm market (0.20) -> more sensitive, easier to trigger
+        #   volatile market (0.35) -> requires stronger signal
         mr_long_sig, mr_short_sig, exhaustion_reason = check_exhaustion_signal(
             df_i, vwap, spy_ret, adaptive_ofi)
 
@@ -1367,7 +1377,7 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
             intraday_blocked = True
             intraday_block_reason = "NO_VOL_DIVERGENCE"
 
-        # MR composite score — rewards exhaustion signals, penalises momentum
+        # MR composite score - rewards exhaustion signals, penalises momentum
         z_now = (closes[-1] - np.mean(closes[-20:])) / (np.std(closes[-20:], ddof=1) + 1e-9)                 if len(closes) >= 20 else 0.0
         exhaustion_score = min(100.0, abs(z_now) / Z_ENTRY_THRESH * 60
                                + (30 if mr_long_sig or mr_short_sig else 0)
@@ -1381,14 +1391,14 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
             raw * market["mkt_mult"] * (1.0 if add_b else 0.80) * hlth,
             0, 100)), 1)
 
-        # MR can fire LONG or SHORT — apply direction-appropriate market gate
+        # MR can fire LONG or SHORT - apply direction-appropriate market gate
         mr_direction = "LONG" if mr_long_sig else "SHORT"
         direction_ok  = (market["allows_long"] if mr_direction == "LONG"
                          else True)  # shorts valid even in RISK-OFF
         alert = (comp >= SIGNAL_THRESHOLD and not intraday_blocked
                  and hlth > 0.0 and direction_ok)
 
-        # MR exit: VWAP touch or 0.5% scalp — NOT ATR target
+        # MR exit: VWAP touch or 0.5% scalp - NOT ATR target
         # Stop = larger of ATR-based (adapts to stock volatility) or 0.8% floor
         atr_stop = round(price - atr * ATR_STOP_MULT, 2) if atr > 0 else 0.0
         pct_stop = round(price * (1 - MR_STOP_LOSS_PCT), 2)
@@ -1423,11 +1433,11 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
                   H_daily >= thresholds["hurst_min"] and
                   hawk_sc >= thresholds["hawkes_min"])
     else:
-        r2k_ok = True  # watchlist mode — standard threshold
+        r2k_ok = True  # watchlist mode - standard threshold
 
     # Final combined alert gate
     alert_final = alert and r2k_ok
-    # Range filter warning — doesn't block but shown on card
+    # Range filter warning - doesn't block but shown on card
     rf_warning = alert_final and not rf_confirms
 
     return {
@@ -1478,26 +1488,38 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
 def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
     """
     Parallel scan using ThreadPoolExecutor.
-    Tracks FULL rejection reason for every blocked symbol so dashboard
-    can show exactly why each stock was filtered out.
+    Auto-reloads watchlist from auto_watchlist.txt if it exists and is newer.
+    Tracks FULL rejection reason for every blocked symbol.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    global WATCHLIST
+    # Auto-refresh watchlist from file if it exists (§ watchlist updates every scan)
+    if symbols is WATCHLIST and os.path.exists("auto_watchlist.txt"):
+        try:
+            fresh = [s.strip().upper()
+                     for s in open("auto_watchlist.txt").read().split("\n")
+                     if s.strip()]
+            if fresh:
+                WATCHLIST = fresh
+                symbols   = fresh
+        except Exception:
+            pass
     market   = get_market_regime()
     results  = []
     rejected = []   # list of dicts: {symbol, reason, detail}
 
-    # Pre-check market cap (fast — uses 1h cache)
+    # Pre-check market cap (fast - uses 1h cache)
     qualified = []
     for sym in symbols:
         ok, mb = is_midcap(sym)
         if not ok:
             reason = "BELOW_MIN_CAP" if mb < MIDCAP_MIN/1e9 else "ABOVE_MAX_CAP"
             rejected.append({"symbol":sym,"reason":reason,
-                             "detail":f"${mb:.2f}B (need $300M–$15B)"})
+                             "detail":f"${mb:.2f}B (need $300M-$20B)"})
         else:
             qualified.append(sym)
 
-    # Parallel scan — capture why each symbol was rejected inside scan_symbol
+    # Parallel scan - capture why each symbol was rejected inside scan_symbol
     def _scan_one(sym):
         try:
             # Run each firewall manually to get the specific rejection reason
@@ -1523,7 +1545,7 @@ def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
             etf = SECTOR_MAP.get(sym, "SPY")
             _, _, sec_gate = get_sector_rs(etf)
             if not sec_gate:
-                return sym, None, "SECTOR_RS", f"{etf} RS < 1.05 (sector lagging SPY)"
+                return sym, None, "SECTOR_RS", f"{etf} RS={sec_rs:.3f} < {SECTOR_RS_MIN} (sector lagging SPY)"
 
             r = scan_symbol(sym, market, timeframe)
             if r:
@@ -1565,7 +1587,7 @@ def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
 # ── Universe Scanner ──────────────────────────────────────────────────────────
 
 def universe_prefilter(symbols: list) -> list:
-    """Original sequential prefilter — kept as fallback."""
+    """Original sequential prefilter - kept as fallback."""
     survivors = []
     for sym in symbols:
         try:
@@ -1580,7 +1602,7 @@ def universe_prefilter(symbols: list) -> list:
             if ok: survivors.append(sym)
         except Exception:
             continue
-    print(f"[UNIVERSE] {len(symbols)} → {len(survivors)} survivors")
+    print(f"[UNIVERSE] {len(symbols)} -> {len(survivors)} survivors")
     return survivors
 
 
@@ -1592,7 +1614,7 @@ def universe_prefilter_fast(symbols: list) -> list:
     Falls back to sequential if batch download fails.
     """
     try:
-        # Single batch download — yfinance fetches all symbols in one call
+        # Single batch download - yfinance fetches all symbols in one call
         raw = yf.download(
             symbols, period="1mo", interval="1d",
             group_by="ticker", auto_adjust=True,
@@ -1617,7 +1639,7 @@ def universe_prefilter_fast(symbols: list) -> list:
                 if ok: survivors.append(sym)
             except Exception:
                 continue
-        print(f"[UNIVERSE FAST] {len(symbols)} → {len(survivors)} survivors")
+        print(f"[UNIVERSE FAST] {len(symbols)} -> {len(survivors)} survivors")
         return survivors
     except Exception as e:
         print(f"[UNIVERSE FAST] Batch failed ({e}), falling back to sequential")
@@ -1626,7 +1648,7 @@ def universe_prefilter_fast(symbols: list) -> list:
 
 def run_universe_scan(top_n: int = 30, timeframe: str = "5m") -> pd.DataFrame:
     """
-    Two-stage universe scan — both stages parallelized.
+    Two-stage universe scan - both stages parallelized.
     Stage 1 (prefilter): parallel HTTP batch using yf.download().
     Stage 2 (full scan):  parallel via ThreadPoolExecutor.
     Removes the 0.3s sleep (was needed for sequential rate limiting,
@@ -1661,7 +1683,7 @@ def run_universe_scan(top_n: int = 30, timeframe: str = "5m") -> pd.DataFrame:
                                             ascending=False).reset_index(drop=True)
     with open("auto_watchlist.txt", "w") as f:
         f.write("\n".join(df.head(top_n)["symbol"].tolist()))
-    print(f"[UNIVERSE] Saved top {top_n} → auto_watchlist.txt")
+    print(f"[UNIVERSE] Saved top {top_n} -> auto_watchlist.txt")
     export_excel(df, market)
     return df
 
@@ -1671,7 +1693,7 @@ def run_universe_scan(top_n: int = 30, timeframe: str = "5m") -> pd.DataFrame:
 # Applies R2K-specific stricter thresholds automatically.
 # Run: set UNIVERSE_MODE = "RUSSELL2000" then call run_russell2000_scan()
 
-# Full Russell 2000 constituent list — loaded from IWM holdings or static list
+# Full Russell 2000 constituent list - loaded from IWM holdings or static list
 # This is a representative subset; for live use fetch from iShares IWM holdings
 RUSSELL2000_SYMBOLS = [
     # Technology
@@ -1745,13 +1767,13 @@ def run_russell2000_scan(timeframe: str = "5m", top_n: int = 30) -> tuple:
     Architecture:
       1. Fetch constituent list (live from iShares or built-in)
       2. Stage 1 fast prefilter: price > $5, avg vol > 300K, ATR% > 2%
-         Done in batches of 500 via yf.download() — much faster than per-symbol
+         Done in batches of 500 via yf.download() - much faster than per-symbol
       3. Stage 2 full scan: all 10 layers on survivors
          Uses R2K stricter thresholds: $10M vol, 1.5x RelVol, score > 72
 
     Rate limit strategy: 3-second pause between 500-symbol batches.
-    Expected time: ~8–12 min for full 2000 symbol scan.
-    Expected survivors: 15–40 stocks depending on market conditions.
+    Expected time: ~8-12 min for full 2000 symbol scan.
+    Expected survivors: 15-40 stocks depending on market conditions.
     """
     global UNIVERSE_MODE
     original_mode = UNIVERSE_MODE
@@ -1767,7 +1789,7 @@ def run_russell2000_scan(timeframe: str = "5m", top_n: int = 30) -> tuple:
           f"Score>{thresholds['signal_thresh']}")
 
     symbols = fetch_russell2000_symbols()
-    print(f"[R2K] Universe: {len(symbols)} symbols → scanning in batches of {batch_size}")
+    print(f"[R2K] Universe: {len(symbols)} symbols -> scanning in batches of {batch_size}")
 
     # Stage 1: fast prefilter in batches
     survivors = []
@@ -1801,7 +1823,7 @@ def run_russell2000_scan(timeframe: str = "5m", top_n: int = 30) -> tuple:
         if b_idx < len(batches) - 1:
             time.sleep(3)
 
-    print(f"[R2K] Stage 1 complete: {len(symbols)} → {len(survivors)} survivors")
+    print(f"[R2K] Stage 1 complete: {len(symbols)} -> {len(survivors)} survivors")
 
     # Stage 2: full 10-layer scan on survivors
     market  = get_market_regime()
@@ -1870,10 +1892,10 @@ def run_russell2000_scan(timeframe: str = "5m", top_n: int = 30) -> tuple:
 def export_excel(df: pd.DataFrame, market: dict):
     """
     Writes two Excel files every time:
-      1. scan_YYYY-MM-DD_HHMM.xlsx  — timestamped snapshot (history preserved)
-      2. scan_latest.xlsx           — always overwritten (quick access to newest)
+      1. scan_YYYY-MM-DD_HHMM.xlsx  - timestamped snapshot (history preserved)
+      2. scan_latest.xlsx           - always overwritten (quick access to newest)
     Both go to ~/Downloads.
-    Sheets: Full Scan · Top Picks (alerts only) · Market Context · Rejected Stocks
+    Sheets: Full Scan | Top Picks (alerts only) | Market Context | Rejected Stocks
     """
     try:
         import openpyxl
@@ -1891,11 +1913,11 @@ def export_excel(df: pd.DataFrame, market: dict):
 
     top     = df[df["alert"] == True] if not df.empty else pd.DataFrame()
     rejected = pd.DataFrame(market.get("rejected_detail", []))
-    mkt_row = {**{k: market.get(k,"—") for k in
+    mkt_row = {**{k: market.get(k,"--") for k in
                   ["regime","spy_price","spy_dev","qqq_price","qqq_dev","scanned","blocked_count"]},
                "Date":       datetime.now().strftime("%Y-%m-%d"),
                "Time":       datetime.now().strftime("%H:%M:%S"),
-               "ADD Bullish":str(_add_cache.get("bullish","—")),
+               "ADD Bullish":str(_add_cache.get("bullish","--")),
                "Strategy":   STRATEGY_MODE,
                "Signals":    len(top)}
 
@@ -1922,7 +1944,7 @@ def export_excel(df: pd.DataFrame, market: dict):
             )
         st.session_state["last_export_time"] = datetime.now().strftime("%H:%M:%S")
         st.session_state["last_export_path"] = fpath_ts
-        st.success(f"✅ Saved → {fname_ts}  +  scan_latest.xlsx")
+        st.success(f"✅ Saved -> {fname_ts}  +  scan_latest.xlsx")
     else:
         print(f"[EXPORT] {fpath_ts} + scan_latest.xlsx")
 
@@ -1952,13 +1974,13 @@ _start_background()
 DASH_CSS = """<style>
 *{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif!important;}
 
-/* Base — white background */
+/* Base - white background */
 html,body,[class*="css"]{background:#ffffff!important;color:#1a1a1a!important;}
 
-/* Sidebar — light grey with yellow top border */
+/* Sidebar - light grey with yellow top border */
 section[data-testid="stSidebar"]{background:#f5f5f5!important;border-right:3px solid #f5c400!important;}
 
-/* Buttons — blue */
+/* Buttons - blue */
 .stButton>button{background:#1a5fd9!important;color:#ffffff!important;font-weight:700!important;
   border:none!important;border-radius:4px!important;letter-spacing:1px!important;
   font-size:13px!important;text-transform:uppercase!important;}
@@ -2015,16 +2037,16 @@ hr{border-color:#e0e0e0!important;}
 </style>"""
 
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
+# -- Dashboard --───────────────────────────────────────────────────────────────
 
 def run_dashboard():
-    st.set_page_config(page_title="QUANT v3", page_icon="⚡",
+    st.set_page_config(page_title="QUANT SCANNER v4", page_icon=None,
                        layout="wide", initial_sidebar_state="expanded")
     st.markdown(DASH_CSS, unsafe_allow_html=True)
 
     # ── Sidebar ──────────────────────────────────────────────
     with st.sidebar:
-        st.header("🔍 v3 Controls")
+        st.subheader("SCANNER v4 CONTROLS")
         timeframe   = st.selectbox("Timeframe", ["15s","1m","5m","15m"], index=2)
 
         # ── Strategy Switch ───────────────────────────────────
@@ -2034,7 +2056,7 @@ def run_dashboard():
             ["AUTO (recommended)", "TREND only", "MEAN REVERSION only"],
             index=0,
             help="AUTO uses ADX+SPY vol to pick the right strategy each scan. "
-                 "Never run both manually — they contradict each other."
+                 "Never run both manually - they contradict each other."
         )
         # Map sidebar choice to global config
         import sys
@@ -2045,20 +2067,20 @@ def run_dashboard():
         auto_list   = open("auto_watchlist.txt").read() if os.path.exists("auto_watchlist.txt") \
                       else "\n".join(WATCHLIST)
         custom_syms = st.text_area("Watchlist (one per line)", value=auto_list, height=250)
-        run_btn     = st.button("▶ RUN SCAN NOW",       use_container_width=True)
-        uni_btn     = st.button("🌍 RUN UNIVERSE SCAN", use_container_width=True)
+        run_btn     = st.button("RUN SCAN NOW",       use_container_width=True)
+        uni_btn     = st.button("RUN UNIVERSE SCAN", use_container_width=True)
         refresh     = st.slider("Auto-Refresh (sec)", 10, 300, 60)
         _           = st.number_input("Account Size ($)", value=int(ACCOUNT_SIZE), step=5000, format="%d")
         st.markdown("---")
         st.markdown(f"<div style='font-size:10px;font-weight:600;color:#555555'>"
                     f"<span style='color:#1a1a1a;font-weight:800'>10-LAYER ENGINE</span><br>"
-                    f"✓ Hurst · Hawkes · OFI<br>"
-                    f"✓ Sector RS · ADD Breadth<br>"
-                    f"✓ Z-Score · Kurt/Skew<br>"
-                    f"✓ Bayesian · Half-Life · ATR<br><br>"
-                    f"<span style='color:#1a5fd9'>CAP: $300M–$15B · TF: {timeframe}</span><br>"
+                    f"Hurst | Hawkes | OFI<br>"
+                    f"Sector RS | ADD Breadth<br>"
+                    f"Z-Score | Kurt/Skew<br>"
+                    f"Bayesian | Half-Life | ATR<br><br>"
+                    f"<span style='color:#1a5fd9'>CAP: $300M-$20B | TF: {timeframe}</span><br>"
                     f"<span style='color:{'#1a8c2a' if SCHWAB_AVAILABLE else '#d94040'}'>"
-                    f"{'✓ Schwab connected' if SCHWAB_AVAILABLE else '⚠ yfinance only — 15s delay'}"
+                    f"{'Schwab API: Connected' if SCHWAB_AVAILABLE else 'Data: yfinance (15s delay)'}"
                     f"</span></div>",
                     unsafe_allow_html=True)
 
@@ -2074,7 +2096,7 @@ def run_dashboard():
     if uni_btn:
         with st.spinner("Universe scan (~15 min)..."):
             run_universe_scan(30, timeframe)
-        st.success("Done — watchlist updated")
+        st.success("Done - watchlist updated")
 
     if run_btn or (now - st.session_state["last_scan"] > refresh) or st.session_state["last_scan"] == 0:
         with st.spinner(f"Scanning {len(symbols)} symbols..."):
@@ -2082,7 +2104,7 @@ def run_dashboard():
         st.session_state.update({"results":df,"market":market,
                                    "last_scan":now,"count":st.session_state["count"]+1})
 
-        # ── AUTO-EXPORT: runs every scan — even if 0 results ─────
+        # ── AUTO-EXPORT: runs every scan - even if 0 results ─────
         try:
             dl_dir   = os.path.join(os.path.expanduser("~"), "Downloads")
             os.makedirs(dl_dir, exist_ok=True)
@@ -2104,7 +2126,7 @@ def run_dashboard():
 
             # 3. Always write rejection log (separate file, appends all day)
             rej = market.get("rejected_detail", [])
-            if rej:
+            if len(rej) > 0:
                 rej_log = os.path.join(dl_dir, f"rejections_log_{today}.csv")
                 df_rej  = pd.DataFrame(rej)
                 df_rej["scan_time"] = datetime.now().strftime("%H:%M:%S")
@@ -2113,7 +2135,7 @@ def run_dashboard():
                 df_rej.to_csv(rej_log, mode="a", header=rej_header, index=False)
 
         except Exception as e:
-            st.warning(f"⚠️ Auto-export failed: {e}")
+            st.warning(f"Auto-export failed: {e}")
 
     df, market, count = st.session_state["results"], st.session_state["market"], st.session_state["count"]
 
@@ -2121,14 +2143,14 @@ def run_dashboard():
     c1, c2 = st.columns([3, 1])
     add_val, add_bull = get_add_breadth()
     with c1:
-        st.markdown('<div class="hdr">▲ QUANT SCANNER v3</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="sub">10-LAYER ENGINE · {timeframe.upper()} · CAP $300M–$15B</div>', unsafe_allow_html=True)
+        st.markdown('<div class="hdr">QUANT SCANNER v4</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sub">10-LAYER ENGINE | {timeframe.upper()} | CAP $300M-$20B</div>', unsafe_allow_html=True)
     with c2:
         ac = "#1a5fd9" if add_bull else "#d94040"
         st.markdown(f'<div style="text-align:right;margin-top:6px">'
-                    f'<div class="sub">{datetime.now().strftime("%H:%M:%S")} EST · SCAN #{count}</div>'
+                    f'<div class="sub">{datetime.now().strftime("%H:%M:%S")} EST | SCAN #{count}</div>'
                     f'<div style="font-size:12px;font-weight:700;color:{ac}">'
-                    f'ADD {"▲ BULLISH" if add_bull else "▼ BEARISH"} ({add_val:.3f})</div>'
+                    f'ADD {"BULLISH" if add_bull else "BEARISH"} ({add_val:.3f})</div>'
                     f'<div class="sub">NEXT REFRESH {max(0,int(refresh-(now-st.session_state["last_scan"])))}s</div>'
                     f'</div>', unsafe_allow_html=True)
 
@@ -2139,20 +2161,20 @@ def run_dashboard():
             f'<div style="font-size:12px;font-weight:600;color:#444444;'
             f'letter-spacing:2px;margin-bottom:14px;text-transform:uppercase;'
             f'border-bottom:1px solid #e0e0e0;padding-bottom:8px">'
-            f'MARKET: <span style="color:{rc}">{market.get("regime","—")}</span>'
-            f'&nbsp;&nbsp;|&nbsp;&nbsp;SPY {market.get("spy_price","—")} '
+            f'MARKET: <span style="color:{rc}">{market.get("regime","--")}</span>'
+            f'&nbsp;&nbsp;|&nbsp;&nbsp;SPY {market.get("spy_price","--")} '
             f'<span style="color:{"#1a8c2a" if market.get("spy_dev",0)>0 else "#d94040"}">'
             f'({market.get("spy_dev",0):+.2f}%)</span>'
-            f'&nbsp;&nbsp;|&nbsp;&nbsp;QQQ {market.get("qqq_price","—")} '
+            f'&nbsp;&nbsp;|&nbsp;&nbsp;QQQ {market.get("qqq_price","--")} '
             f'<span style="color:{"#1a8c2a" if market.get("qqq_dev",0)>0 else "#d94040"}">'
             f'({market.get("qqq_dev",0):+.2f}%)</span>'
-            f'&nbsp;&nbsp;|&nbsp;&nbsp;✅ {market.get("scanned",0)} SCANNED'
+            f'&nbsp;&nbsp;|&nbsp;&nbsp;{market.get("scanned",0)} SCANNED'
             + (
                 (lambda rej: (
-                    f'&nbsp;&nbsp;🚫 {len(rej)} BLOCKED'
+                    f'&nbsp;&nbsp;{len(rej)} BLOCKED'
                     + (lambda groups: "".join(
                         f'&nbsp;<span style="color:#888888;font-size:10px">'
-                        f'[{k}×{v}]</span>'
+                        f'[{k}:{v}]</span>'
                         for k,v in groups.items()
                     ))(
                         {r["reason"]: sum(1 for x in rej if x["reason"]==r["reason"])
@@ -2164,20 +2186,20 @@ def run_dashboard():
             + f'</div>', unsafe_allow_html=True)
 
     if df.empty:
-        st.warning("⚠️ Scan returned 0 results — all symbols were filtered out. See rejection details below.")
-        # DO NOT return — fall through so rejected panel and export still render
+        st.warning("Scan returned 0 results - all symbols were filtered out. See rejection details below.")
+        # DO NOT return - fall through so rejected panel and export still render
 
     # ── Results sections (only when scan has results) ─────────
     if not df.empty:
       # Alert banner
       alerts = df[df["alert"] == True]
       if not alerts.empty:
-        syms = "  ·  ".join(f"{r['symbol']} [{r['score']}] {r['bayes_prob']:.0f}%" for _,r in alerts.iterrows())
+        syms = "  |  ".join(f"{r['symbol']} [{r['score']}] {r['bayes_prob']:.0f}%" for _,r in alerts.iterrows())
         st.markdown(
             f'<div style="background:#fffdf0;border:2px solid #f5c400;'
             f'border-left:6px solid #f5c400;border-radius:4px;padding:12px 18px;'
             f'margin-bottom:14px;font-size:13px;font-weight:700;color:#b08800;'
-            f'letter-spacing:2px;text-transform:uppercase">▶ SIGNAL ALERT  ·  {syms}</div>',
+            f'letter-spacing:2px;text-transform:uppercase">SIGNAL ALERT  |  {syms}</div>',
             unsafe_allow_html=True)
 
     # ── Golden Entry Banner ───────────────────────────────────
@@ -2186,7 +2208,7 @@ def run_dashboard():
     if "golden_entry" in df.columns:
         golden = df[df["golden_entry"] == True]
         if not golden.empty:
-            ge_syms = "  ·  ".join(
+            ge_syms = "  |  ".join(
                 f"{r['symbol']} Z={r['zscore']:.2f} VWAP${r.get('vwap',0):.2f}"
                 for _, r in golden.iterrows()
             )
@@ -2196,7 +2218,7 @@ def run_dashboard():
                 f'padding:14px 18px;margin-bottom:14px;">'
                 f'<div style="font-size:13px;font-weight:800;color:#b08800;'
                 f'letter-spacing:2px;text-transform:uppercase;margin-bottom:4px">'
-                f'⭐ GOLDEN ENTRY SETUP — Z ≤ -2.0 + BELOW VWAP</div>'
+                f'GOLDEN ENTRY  |  Z &le; -2.0 + BELOW VWAP</div>'
                 f'<div style="font-size:12px;font-weight:600;color:#1a1a1a">'
                 f'{ge_syms}</div>'
                 f'<div style="font-size:10px;color:#888888;margin-top:4px">'
@@ -2214,34 +2236,34 @@ def run_dashboard():
         bp     = r["bayes_prob"]
         bp_col = "#b08800" if bp>=70 else "#1a5fd9" if bp>=55 else "#d94040"
         css    = "on" if r["alert"] else ("warn" if sc>=55 else "")
-        hl_str = f"⏱ {int(r['hl_remaining'])}s" if r["hl_alive"] else "—"
-        strat  = r.get("strategy","—")
+        hl_str = f"{int(r['hl_remaining'])}s" if r["hl_alive"] else "expired"
+        strat  = r.get("strategy","--")
         adx_v  = r.get("adx", 0.0)
-        exit_t = r.get("exit_type","—")
+        exit_t = r.get("exit_type","--")
 
         # Strategy badge colour
         strat_col = "#1a5fd9" if strat=="TREND" else "#b08800" if strat=="MEAN_REVERSION" else "#888888"
-        strat_lbl = "📈 TREND" if strat=="TREND" else "🔄 MEAN REV" if strat=="MEAN_REVERSION" else strat
+        strat_lbl = "TREND" if strat=="TREND" else "MEAN REV" if strat=="MEAN_REVERSION" else strat
 
         conflict_tag = ""
         if r.get("hurst_conflict", False):
-            conflict_tag = '<span class="tag" style="background:#fff0f0;color:#d94040;border:1px solid #f0c0c0;font-weight:800">⚠ HURST CONFLICT</span>'
+            conflict_tag = '<span class="tag" style="background:#fff0f0;color:#d94040;border:1px solid #f0c0c0;font-weight:800">HURST CONFLICT</span>'
         blocked_tag = ""
         if r.get("intraday_blocked", False):
-            blocked_tag = f'<span class="tag" style="background:#fff0f0;color:#d94040;border:1px solid #f0c0c0">🚫 BLOCKED</span>'
+            blocked_tag = f'<span class="tag" style="background:#fff0f0;color:#d94040;border:1px solid #f0c0c0">BLOCKED</span>'
 
         h_intra     = r.get("hurst_H_intra", r.get("hurst_H", 0))
         scan_mode   = r.get("mode","auto").upper()
 
         # Mean reversion specific display
         if strat == "MEAN_REVERSION":
-            trade_html = (f'<div class="trade">{"🟢 LONG" if r.get("mr_long") else "🔴 SHORT"} EXHAUSTION<br>'
-                          f'ENTRY ${r["price"]} · STOP ${r["stop"]} · EXIT AT VWAP ${r["vwap"]:.2f}<br>'
-                          f'Kelly {r["kelly_frac"]:.1%} → {r["shares"]} shares · TP 0.5% or VWAP</div>'
+            trade_html = (f'<div class="trade">{"LONG" if r.get("mr_long") else "SHORT"} EXHAUSTION<br>'
+                          f'ENTRY ${r["price"]}  |  STOP ${r["stop"]}  |  EXIT AT VWAP ${r["vwap"]:.2f}<br>'
+                          f'Kelly {r["kelly_frac"]:.1%} -> {r["shares"]} shares  |  TP 0.5% or VWAP</div>'
                           if r["alert"] else "")
         else:
-            trade_html = (f'<div class="trade">ENTRY ${r["price"]} · STOP ${r["stop"]} · TARGET ${r["target"]}<br>'
-                          f'Kelly {r["kelly_frac"]:.1%} → {r["shares"]} shares · ${r["dollar_risk"]} risk</div>'
+            trade_html = (f'<div class="trade">ENTRY ${r["price"]}  |  STOP ${r["stop"]}  |  TARGET ${r["target"]}<br>'
+                          f'Kelly {r["kelly_frac"]:.1%} -> {r["shares"]} shares  |  ${r["dollar_risk"]} risk</div>'
                           if r["alert"] else "")
         with cols[i % len(cols)]:
             st.markdown(f"""
@@ -2249,7 +2271,7 @@ def run_dashboard():
               <div style="display:flex;justify-content:space-between;align-items:flex-start">
                 <div>
                   <div class="sym">{r['symbol']}</div>
-                  <div style="font-size:11px;font-weight:500;color:#666666">${r['price']} &nbsp;·&nbsp; MCap ${r.get('mcap_b',0):.1f}B &nbsp;·&nbsp; {scan_mode}</div>
+                  <div style="font-size:11px;font-weight:500;color:#666666">${r['price']} &nbsp;|&nbsp; MCap ${r.get('mcap_b',0):.1f}B &nbsp;|&nbsp; {scan_mode}</div>
                 </div>
                 <div style="text-align:right">
                   <div class="sc" style="color:{sc_col}">{sc}</div>
@@ -2264,11 +2286,11 @@ def run_dashboard():
                 <span class="tag" style="background:#eef3ff;color:#1a5fd9;border:1px solid #c0d0f0">{r['hurst_regime']}</span>
                 <span class="tag" style="background:#eef3ff;color:#1a5fd9;border:1px solid #c0d0f0">{r['hawkes_sig']}</span>
                 <span class="tag" style="background:#eef3ff;color:#1a5fd9;border:1px solid #c0d0f0">{r['ofi_sig']}</span>
-                <span class="tag" style="background:#f8f8f8;color:{'#1a8c2a' if r['add_bull'] else '#d94040'};border:1px solid #dddddd">ADD {'▲' if r['add_bull'] else '▼'}</span>
+                <span class="tag" style="background:#f8f8f8;color:{'#1a8c2a' if r['add_bull'] else '#d94040'};border:1px solid #dddddd">ADD BULL</span>
                 <span class="tag" style="background:#f8f8f8;color:{'#1a8c2a' if r['zscore_ok'] else '#d94040'};border:1px solid #dddddd">Z={r['zscore']:.2f}</span>
                 <span class="tag" style="background:#fffdf0;color:#b08800;border:1px solid #f0e080">{r['ks_label']}</span>
                 {conflict_tag}{blocked_tag}
-                {"<span class=\"tag\" style=\"background:#fff8e1;color:#b08800;border:2px solid #f5c400;font-weight:800\">⭐ GOLDEN ENTRY</span>" if r.get("golden_entry") else ""}
+                {"<span class=\"tag\" style=\"background:#fff8e1;color:#b08800;border:2px solid #f5c400;font-weight:800\">GOLDEN ENTRY</span>" if r.get("golden_entry") else ""}
               </div>
               <div class="row">
                 <div class="cell"><div class="lbl">HURST D</div><div class="val">{r['hurst_H']}</div></div>
@@ -2276,18 +2298,18 @@ def run_dashboard():
                   <div class="val" style="color:{'#1a8c2a' if h_intra>0.55 else '#d94040' if h_intra<0.42 else '#888888'}">{h_intra}</div></div>
                 <div class="cell"><div class="lbl">OFI</div><div class="val">{r['ofi']}</div></div>
                 <div class="cell" style="{'background:#fff8e1;border:1px solid #f5c400' if r.get('golden_entry') else ''}">
-                  <div class="lbl">Z-SCORE{'  ⭐' if r.get('golden_entry') else ''}</div>
+                  <div class="lbl">Z-SCORE{" GOLDEN" if r.get("golden_entry") else ""}</div>
                   <div class="val" style="color:{'#b08800' if r.get('golden_entry') else '#d94040' if float(r['zscore'])<=-2.0 else '#1a8c2a' if float(r['zscore'])>=2.0 else '#1a1a1a'};{'font-weight:800' if abs(float(r['zscore']))>=2.0 else ''}">{r['zscore']:.2f}</div></div>
               </div>
               <div class="row">
                 <div class="cell"><div class="lbl">SECTOR</div>
-                  <div class="val" style="color:{'#1a8c2a' if r['sector_gate'] else '#d94040'}">{r['sector_etf']} {'✓' if r['sector_gate'] else '✗'}</div></div>
+                  <div class="val" style="color:{'#1a8c2a' if r['sector_gate'] else '#d94040'}">{r['sector_etf']} {"OK" if r["sector_gate"] else "FAIL"}</div></div>
                 <div class="cell"><div class="lbl">R:R</div>
-                  <div class="val" style="color:{'#1a8c2a' if r['rr_ok'] else '#d94040'}">{'✓' if r['rr_ok'] else '✗'} {r['rr_ratio']:.1f}:1</div></div>
+                  <div class="val" style="color:{'#1a8c2a' if r['rr_ok'] else '#d94040'}">{"OK" if r["rr_ok"] else "--"} {r["rr_ratio"]:.1f}:1</div></div>
                 <div class="cell"><div class="lbl">HALF-LIFE</div><div class="val">{hl_str}</div></div>
                 <div class="cell" style="{'background:#fff0f0' if r.get('below_vwap') else 'background:#f0fff4'}">
                   <div class="lbl">VWAP</div>
-                  <div class="val" style="color:{'#d94040' if r.get('below_vwap') else '#1a8c2a'}">${r.get('vwap',0):.2f} {'↓' if r.get('below_vwap') else '↑'}</div></div>
+                  <div class="val" style="color:{'#d94040' if r.get('below_vwap') else '#1a8c2a'}">${r.get('vwap',0):.2f} {"BELOW" if r.get("below_vwap") else "ABOVE"}</div></div>
               </div>
               {trade_html}
             </div>""", unsafe_allow_html=True)
@@ -2295,7 +2317,7 @@ def run_dashboard():
     # ── Trade Log ─────────────────────────────────────────────
     if TRADE_LOG:
         st.markdown("---")
-        st.markdown("### 📋 Trade Log")
+        st.markdown("### Trade Log")
         total = sum(t["P&L $"] for t in TRADE_LOG)
         wins  = sum(1 for t in TRADE_LOG if t["P&L $"] > 0)
         m1,m2,m3,m4 = st.columns(4)
@@ -2311,43 +2333,43 @@ def run_dashboard():
     if not eligible.empty:
         top = eligible.sort_values(by=["bayes_prob","score"], ascending=False).iloc[0]
         sec_bull  = bool(top.get("sector_gate", True))
-        etf_name  = top.get("sector_etf","—")
+        etf_name  = top.get("sector_etf","--")
         above_vwap = not bool(top.get("below_vwap", False))
         hl_rem    = int(top.get("hl_remaining", 600))
         z_val     = float(top.get("zscore", 0))
 
-        st.markdown(f"## 🎯 Top Alpha Pick: **{top['symbol']}**")
-        if sec_bull: st.success(f"✅ Sector Alignment: {top['symbol']} in **{etf_name}** — outperforming SPY")
-        else:        st.warning(f"⚠️ Sector Divergence: **{etf_name}** lagging — reduce position size")
+        st.markdown(f"## Top Alpha Pick: {top['symbol']}")
+        if sec_bull: st.success(f"Sector Alignment: {top['symbol']} in **{etf_name}** - outperforming SPY")
+        else:        st.warning(f"Sector Divergence: **{etf_name}** lagging - reduce position size")
 
         c1, c2, c3 = st.columns(3)
         with c1:
             st.metric("Bayesian Win Prob", f"{top['bayes_prob']:.1f}%",
                       delta="High Conviction" if top['bayes_prob'] >= 65 else "Moderate")
-            st.write(f"**Stop:** ${top['stop']:.2f}  *(1.5× ATR ${top['atr']:.2f})*")
-            st.write(f"**Entry:** ${top['price']:.2f}  ·  **{int(top['shares'])} shares**  (${top['dollar_risk']:.0f} risk)")
+            st.write(f"**Stop:** ${top['stop']:.2f}  *(1.5x ATR ${top['atr']:.2f})*")
+            st.write(f"**Entry:** ${top['price']:.2f}  |  **{int(top['shares'])} shares**  (${top['dollar_risk']:.0f} risk)")
             st.caption(f"Kelly {top['kelly_frac']:.1%} of ${int(ACCOUNT_SIZE):,}")
         with c2:
             st.metric("Target", f"${top['target']:.2f}",
-                      delta=f"{top['rr_ratio']:.1f}:1 R:R {'✅' if top['rr_ok'] else '❌'}")
+                      delta=f"{top['rr_ratio']:.1f}:1 R:R {'OK' if top['rr_ok'] else 'FAIL'}")
             st.write(f"**Profit if hit:** ${(top['target']-top['price'])*top['shares']:.0f}")
-            if above_vwap: st.success("✅ Above VWAP — institutions net buyers")
-            else:          st.error("❌ Below VWAP — wait for reclaim")
+            if above_vwap: st.success("Above VWAP - institutions net buyers")
+            else:          st.error("Below VWAP - wait for VWAP reclaim")
         with c3:
             st.metric("Alpha Half-Life", f"{hl_rem}s",
                       delta=f"{float(top.get('hl_strength',1.0))*100:.0f}% strength")
-            if z_val > 2.0:   st.error(f"Z={z_val:.2f} EXTENDED — reduce size")
-            elif z_val > 1.5: st.warning(f"Z={z_val:.2f} — Elevated")
-            else:             st.success(f"Z={z_val:.2f} ✅ — Healthy")
-            st.write(f"**{top.get('ks_label','—')}** (K:{top.get('kurtosis',0):.2f} S:{top.get('skewness',0):.2f})")
+            if z_val > 2.0:   st.error(f"Z={z_val:.2f} EXTENDED - reduce size")
+            elif z_val > 1.5: st.warning(f"Z={z_val:.2f} - Elevated")
+            else:             st.success(f"Z={z_val:.2f} - Healthy")
+            st.write(f"**{top.get('ks_label','--')}** (K:{top.get('kurtosis',0):.2f} S:{top.get('skewness',0):.2f})")
 
         # 7-point checklist
         checks = [
-            ("Market",    "RISK-OFF" not in market.get("regime",""), market.get("regime","—")),
+            ("Market",    "RISK-OFF" not in market.get("regime",""), market.get("regime","--")),
             ("Sector",    sec_bull,                                   etf_name),
             ("ADD",       bool(top.get("add_bull",True)),             f"{top.get('add_val',0):.3f}"),
             ("Z-Score",   bool(top.get("zscore_ok",True)),            f"Z={z_val:.2f}"),
-            ("R:R ≥ 2",   bool(top.get("rr_ok",False)),              f"{top.get('rr_ratio',0):.1f}:1"),
+            ("R:R >= 2",   bool(top.get("rr_ok",False)),              f"{top.get('rr_ratio',0):.1f}:1"),
             ("VWAP",      above_vwap,                                 f"${top.get('vwap',0):.2f}"),
             ("Half-Life", bool(top.get("hl_alive",True)),             f"{hl_rem}s"),
         ]
@@ -2359,26 +2381,26 @@ def run_dashboard():
                     f"padding:8px 4px;border-radius:3px;"
                     f"background:{'#fffdf0' if ok else '#fff0f0'};"
                     f"border:1px solid {'#f5c400' if ok else '#e05050'}'>"
-                    f"{'✅' if ok else '❌'}&nbsp; {label}<br>"
+                    f"{'OK' if ok else '--'}&nbsp; {label}<br>"
                     f"<span style='font-size:10px;font-weight:500;color:#666666'>{detail}</span></div>",
                     unsafe_allow_html=True)
 
         verdict_color = "#b08800" if passed >= 6 else "#1a5fd9" if passed >= 4 else "#d94040"
-        verdict_text  = "▲ ALL CLEAR — EXECUTE"    if passed >= 6 else \
-                        "— PARTIAL — REDUCE SIZE"   if passed >= 4 else "✕ BLOCKED — DO NOT ENTER"
+        verdict_text  = "ALL CLEAR - EXECUTE"    if passed >= 6 else \
+                        "PARTIAL - REDUCE SIZE"   if passed >= 4 else "BLOCKED - DO NOT ENTER"
         st.markdown(
             f"<div style='text-align:center;font-size:16px;font-weight:800;"
             f"color:{verdict_color};padding:14px;border-radius:4px;letter-spacing:3px;"
             f"text-transform:uppercase;border:2px solid {verdict_color};"
             f"background:{'#fffdf0' if passed>=6 else '#f0f4ff' if passed>=4 else '#fff0f0'};"
-            f"margin-top:14px'>{verdict_text} &nbsp;·&nbsp; {passed}/{len(checks)} CHECKS PASSED</div>",
+            f"margin-top:14px'>{verdict_text} &nbsp;|&nbsp; {passed}/{len(checks)} CHECKS PASSED</div>",
             unsafe_allow_html=True)
     else:
-        st.info("🎯 No execution-grade signals right now — watching and waiting.")
+        st.info("No execution-grade signals this scan - watching and waiting.")
 
     # ── Full Results Table ─────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 📊 Full Scan Results")
+    st.markdown("### Full Scan Results")
 
     if not df.empty:
         # Build display DataFrame
@@ -2399,20 +2421,20 @@ def run_dashboard():
 
         # Rename for readability
         df_show = df_show.rename(columns={
-            "golden_entry":  "⭐ Golden",
+            "golden_entry":  "Golden",
             "bayes_prob":    "Bayes%",
             "below_vwap":    "< VWAP",
             "sector_etf":    "Sector",
-            "add_bull":      "ADD ▲",
-            "rr_ok":         "R:R ✓",
+            "add_bull":      "ADD Bull",
+            "rr_ok":         "R:R OK",
             "kelly_frac":    "Kelly%",
             "health_label":  "Health",
             "mcap_b":        "MCap $B",
         })
 
-        # Streamlit styling — highlight golden rows yellow, z-score column red/green
+        # Streamlit styling - highlight golden rows yellow, z-score column red/green
         def highlight_golden(row):
-            if row.get("⭐ Golden", False):
+            if row.get("Golden", False):
                 return ["background-color:#fff8e1;font-weight:700"] * len(row)
             return [""] * len(row)
 
@@ -2434,16 +2456,16 @@ def run_dashboard():
         # Golden Entry legend
         st.markdown(
             "<div style='font-size:11px;color:#888888;padding:4px 0'>"
-            "⭐ <b>Golden Entry</b> = Z-Score ≤ -2.0 AND price below VWAP AND strategy = MEAN REVERSION  "
-            "· <span style='color:#d94040;font-weight:700'>Red Z-Score</span> = oversold (long setup)  "
-            "· <span style='color:#1a8c2a;font-weight:700'>Green Z-Score</span> = overbought (short setup)"
+            "<b>Golden Entry</b> = Z-Score &le; -2.0 AND price below VWAP AND strategy = MEAN REVERSION  "
+            "| <span style='color:#d94040;font-weight:700'>Red Z-Score</span> = oversold (long setup)  "
+            "| <span style='color:#1a8c2a;font-weight:700'>Green Z-Score</span> = overbought (short setup)"
             "</div>",
             unsafe_allow_html=True
         )
 
     # ── Rejected / Blocked Stocks (always visible) ────────────
     st.markdown("---")
-    st.markdown("### 🚫 Rejected Stocks — Detailed Reasons")
+    st.markdown("### Rejected Stocks - Filter Reasons")
     rejected_detail = market.get("rejected_detail", [])
     if rejected_detail:
         # Colour-code by rejection reason
@@ -2496,11 +2518,11 @@ def run_dashboard():
                 unsafe_allow_html=True
             )
     else:
-        st.info("No rejections recorded — run a scan first.")
+        st.info("No rejections recorded - run a scan first.")
 
     # ── Export (always visible regardless of scan results) ────
     st.markdown("---")
-    st.markdown("### 📥 Export")
+    st.markdown("### Export")
 
     last_export = st.session_state.get('last_export_time', 'Never')
     last_log    = st.session_state.get('last_log_path', None)
@@ -2508,11 +2530,11 @@ def run_dashboard():
         f"<div style='background:#f0f7ff;border:1px solid #1a5fd9;border-left:4px solid #1a5fd9;"
         f"border-radius:4px;padding:10px 14px;margin-bottom:12px;font-size:11px;"
         f"font-weight:600;color:#1a1a1a'>"
-        f"🔄 AUTO-EXPORT — every scan saves to ~/Downloads/  <br>"
+        f"AUTO-EXPORT - every scan saves to ~/Downloads/<br>"
         f"<span style='color:#666666;font-weight:400'>"
-        f"📊 scan_YYYY-MM-DD_HHMM.xlsx (timestamped) &nbsp;·&nbsp; "
-        f"📊 scan_latest.xlsx (always current) &nbsp;·&nbsp; "
-        f"📋 scan_log_YYYY-MM-DD.csv (appends all day)<br>"
+        f"scan_YYYY-MM-DD_HHMM.xlsx (timestamped) &nbsp;|&nbsp; "
+        f"scan_latest.xlsx (always current) &nbsp;|&nbsp; "
+        f"scan_log_YYYY-MM-DD.csv (appends all day)<br>"
         f"Last export: <b>{last_export}</b></span></div>",
         unsafe_allow_html=True
     )
@@ -2520,16 +2542,16 @@ def run_dashboard():
     ec1, ec2, ec3, ec4 = st.columns(4)
 
     with ec1:
-        # Manual export trigger — works even if df is empty (exports rejected list)
-        if st.button("📊 Export to Excel Now", use_container_width=True):
+        # Manual export trigger - works even if df is empty (exports rejected list)
+        if st.button("Export to Excel Now", use_container_width=True):
             export_excel(df if not df.empty else pd.DataFrame(), market)
-            st.success("✅ Exported to ~/Downloads/")
+            st.success("Exported to ~/Downloads/")
 
     with ec2:
         if not df.empty:
             csv_data = df.to_csv(index=False).encode("utf-8")
             st.download_button(
-                label="📄 Download Results CSV",
+                label="Download Results CSV",
                 data=csv_data,
                 file_name=f"scan_{datetime.now().strftime('%Y-%m-%d_%H%M')}.csv",
                 mime="text/csv",
@@ -2543,7 +2565,7 @@ def run_dashboard():
         if last_log and os.path.exists(last_log):
             with open(last_log, "rb") as f:
                 st.download_button(
-                    label="📋 Download Daily Log",
+                    label="Download Daily Log",
                     data=f.read(),
                     file_name=os.path.basename(last_log),
                     mime="text/csv",
@@ -2559,7 +2581,7 @@ def run_dashboard():
         if rejected_detail_exp:
             rej_csv = pd.DataFrame(rejected_detail_exp).to_csv(index=False).encode("utf-8")
             st.download_button(
-                label=f"🚫 Download Rejections ({len(rejected_detail_exp)})",
+                label=f"Download Rejections ({len(rejected_detail_exp)})",
                 data=rej_csv,
                 file_name=f"rejected_{datetime.now().strftime('%Y-%m-%d_%H%M')}.csv",
                 mime="text/csv",
@@ -2576,7 +2598,7 @@ def run_dashboard():
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("\n[QUANT v3] Run: python -m streamlit run scanner_v3.py\n")
+    print("\n[QUANT v4] Run: python -m streamlit run scanner_v4.py\n")
 
 if STREAMLIT_MODE:
     run_dashboard()
