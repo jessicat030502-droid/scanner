@@ -64,7 +64,18 @@ def header_line():
     lock   = getattr(engine, "GLOBAL_REGIME_LOCK", None)
     limit_o= getattr(engine, "LIMIT_ORDERS_ONLY", True)
 
-    flags = []
+    # ── Active strategy mode ──────────────────────────────────
+    # AUTO = scanner selects TREND or MR each bar based on ADX + SPY vol
+    # TREND / MEAN_REVERSION = forced via --regime flag
+    cfg_mode = getattr(engine, "STRATEGY_MODE", "AUTO")
+    if cfg_mode == "AUTO":
+        mode_display = f"{C_CYAN}AUTO{C_RESET}"
+    elif cfg_mode == "TREND":
+        mode_display = f"{C_GREEN}TREND (forced){C_RESET}"
+    else:
+        mode_display = f"{C_YELLOW}MR (forced){C_RESET}"
+
+    flags = [f"MODE: {mode_display}"]
     if kill:    flags.append(f"{C_RED}[KILL SWITCH]{C_RESET}")
     if lock:    flags.append(f"{C_YELLOW}[LOCKED: {lock}]{C_RESET}")
     if limit_o: flags.append(f"{C_GREEN}[LIMIT ORDERS]{C_RESET}")
@@ -79,8 +90,7 @@ def header_line():
 
     print("=" * W)
     print(f"  QUANT SCANNER v4   |   {now}   |   {src}   |   {umode}")
-    if flags:
-        print("  " + "  ".join(flags))
+    print("  " + "  ".join(flags))
     print("=" * W)
 
 def market_line(market: dict):
@@ -90,9 +100,22 @@ def market_line(market: dict):
     spd = market.get("spy_dev", 0)
     qqq = market.get("qqq_price","--")
     qd  = market.get("qqq_dev", 0)
+    # Show the actual active strategy for this scan (per-bar resolution)
+    # In AUTO mode this shows what strategy the scanner actually used
+    spy_today = market.get("spy_today", 0)
+    active_strategy = market.get("active_strategy", getattr(engine,"STRATEGY_MODE","AUTO"))
+    if active_strategy == "TREND":
+        strat_c = C_GREEN; strat_s = "TREND"
+    elif active_strategy == "MEAN_REVERSION":
+        strat_c = C_YELLOW; strat_s = "MR"
+    elif active_strategy == "NO_TRADE":
+        strat_c = C_RED; strat_s = "NO_TRADE"
+    else:
+        strat_c = C_CYAN; strat_s = "AUTO"
     print(f"  MARKET: {rc}{regime:<14}{C_RESET}"
           f"  |  SPY  {spy}  {pct_color(spd)}({spd:+.2f}%){C_RESET}"
-          f"  |  QQQ  {qqq}  {pct_color(qd)}({qd:+.2f}%){C_RESET}")
+          f"  |  QQQ  {qqq}  {pct_color(qd)}({qd:+.2f}%){C_RESET}"
+          f"  |  {strat_c}[{strat_s}]{C_RESET}")
 
 def blocked_line(market: dict):
     rej = market.get("rejected_detail", [])
@@ -248,10 +271,26 @@ def print_results_table(df: pd.DataFrame, market: dict):
     print("-" * W)
     alerts    = df[df["alert"] == True] if not df.empty else pd.DataFrame()
     goldens   = df[df["golden_entry"] == True] if "golden_entry" in df.columns else pd.DataFrame()
-    strat_c   = df["strategy"].value_counts().to_dict() if "strategy" in df.columns else {}
-    strat_str = "  ".join(f"{k}: {v}" for k,v in strat_c.items())
     gate      = "OPEN" if market.get("allows_long") else "CLOSED"
     gate_c    = C_GREEN if market.get("allows_long") else C_RED
+
+    # Strategy breakdown -- shows what AUTO actually selected this scan
+    strat_c   = df["strategy"].value_counts().to_dict() if "strategy" in df.columns else {}
+    cfg_mode  = getattr(engine, "STRATEGY_MODE", "AUTO")
+    act_strat = market.get("active_strategy", cfg_mode)
+
+    if cfg_mode == "AUTO":
+        trend_n = strat_c.get("TREND", 0)
+        mr_n    = strat_c.get("MEAN_REVERSION", 0)
+        t_c = C_GREEN if trend_n >= mr_n else C_DIM
+        m_c = C_YELLOW if mr_n > trend_n else C_DIM
+        strat_str = (f"{C_CYAN}AUTO{C_RESET}: "
+                     f"{t_c}TREND:{trend_n}{C_RESET} "
+                     f"{m_c}MR:{mr_n}{C_RESET}")
+    else:
+        sc = C_GREEN if cfg_mode == "TREND" else C_YELLOW
+        strat_str = f"{sc}{cfg_mode} (forced){C_RESET}"
+
     print(f"  Signals: {C_GREEN}{len(alerts)}{C_RESET}/{len(df)}"
           f"  |  Golden entries: {C_YELLOW}{len(goldens)}{C_RESET}"
           f"  |  Gate: {gate_c}{gate}{C_RESET}"
@@ -291,10 +330,26 @@ def print_top_picks(df: pd.DataFrame):
         gap_r   = float(r.get("gap_ret", 0))
         vwap    = float(r.get("vwap", 0))
         below_v = bool(r.get("below_vwap", False))
-        vwap_pos = "BELOW" if below_v else "ABOVE"
+        vwap_pos   = "BELOW" if below_v else "ABOVE"
+        vwap_role  = str(r.get("vwap_role", "MAGNET"))
+        vwap_bands = str(r.get("vwap_bands", "1.5/2.5SD"))
+        vwap_l1    = float(r.get("vwap_lower1", vwap))
+        vwap_u1    = float(r.get("vwap_upper1", vwap))
+        vwap_l2    = float(r.get("vwap_lower2", vwap))
+        vwap_u2    = float(r.get("vwap_upper2", vwap))
+        vwap_gap   = r.get("vwap_gap")
+
         print(f"  {'Intraday':<18} {pct_color(intra_r)}{intra_r:+.2f}%{C_RESET} from open"
               f"   Gap: {pct_color(gap_r)}{gap_r:+.2f}%{C_RESET}"
-              f"   VWAP ${vwap:.2f}  ({vwap_pos})")
+              f"   VWAP ${vwap:.2f}  ({vwap_pos} VWAP)")
+        vwap_c = C_YELLOW if vwap_role == "FLOOR" else C_CYAN
+        print(f"  {'VWAP Role':<18} {vwap_c}{vwap_role}{C_RESET}  "
+              f"bands={vwap_bands}  "
+              f"1SD: ${vwap_l1:.2f}-${vwap_u1:.2f}  "
+              f"2SD: ${vwap_l2:.2f}-${vwap_u2:.2f}")
+        if vwap_gap:
+            print(f"  {'Gap VWAP':<18} ${vwap_gap:.2f}  "
+                  f"(gap-open anchor -- institutional support level)")
 
         # Health
         hlth  = float(r.get("health_mult", 1.0))
@@ -364,9 +419,17 @@ def print_top_picks(df: pd.DataFrame):
             print(f"  {C_RED}[BLOCKED]  {i_reason}{C_RESET}")
 
         # Regime reason + liquidity status
+        # In AUTO mode this shows WHY the scanner picked TREND vs MR for this bar
         reg_reason = str(r.get("regime_reason","--"))
         liq_status = str(r.get("liq_status","--"))
-        print(f"  Regime: {reg_reason}  |  Liquidity: {liq_status}")
+        strategy   = str(r.get("strategy","--"))
+        cfg_mode   = getattr(engine, "STRATEGY_MODE", "AUTO")
+
+        # Color-code by strategy
+        strat_c = C_GREEN if strategy == "TREND" else C_YELLOW if strategy == "MEAN_REVERSION" else C_CYAN
+        auto_tag = " (AUTO-selected)" if cfg_mode == "AUTO" else " (forced)"
+        print(f"  Strategy: {strat_c}{strategy}{auto_tag}{C_RESET}  |  Reason: {reg_reason}")
+        print(f"  Liquidity: {liq_status}")
 
         # Range Filter confirmation
         rf_val      = float(r.get("rf_val", 0))
@@ -382,6 +445,35 @@ def print_top_picks(df: pd.DataFrame):
         if rf_warning:
             print(f"  {C_YELLOW}  [WARN] Score above threshold but Range Filter"
                   f" not yet confirming -- wait.{C_RESET}")
+
+        # ── Markov Gate ───────────────────────────────────────
+        mk_stable  = bool(r.get("markov_stable", True))
+        mk_prob    = float(r.get("markov_stay_prob", 1.0))
+        mk_adj     = float(r.get("markov_stop_adj", 1.0))
+        mk_reason  = str(r.get("markov_reason", "MARKOV_DISABLED"))
+        mk_enabled = getattr(engine, "MARKOV_GATE_ENABLED", False)
+
+        if mk_enabled:
+            is_active  = mk_reason.startswith("ACTIVE")
+            is_no_data = mk_reason.startswith("NO_DATA")
+
+            if is_active:
+                mk_c = C_GREEN if mk_stable else C_YELLOW
+                mk_label = "STABLE" if mk_stable else "UNSTABLE"
+                print(f"  {'Markov Gate':<18} "
+                      f"stay={mk_prob:.1%}  stop_adj={mk_adj:.0%}  "
+                      f"{mk_c}{mk_label}{C_RESET}")
+                if not mk_stable:
+                    print(f"  {'':<18} {C_YELLOW}[WARN] Regime unstable -- "
+                          f"score penalised 10%, stop tightened{C_RESET}")
+            elif is_no_data:
+                print(f"  {'Markov Gate':<18} {C_DIM}{mk_reason}{C_RESET}")
+            else:
+                print(f"  {'Markov Gate':<18} {C_DIM}{mk_reason[:65]}{C_RESET}")
+        else:
+            print(f"  {'Markov Gate':<18} {C_DIM}DISABLED  "
+                  f"(run --markov-gate {clean(str(r.get('symbol','')))} "
+                  f"--days 60 to test){C_RESET}")
         stop_p  = float(r.get("stop", 0))
         target  = float(r.get("target", vwap))
         rr      = float(r.get("rr_ratio", 0))
@@ -402,49 +494,65 @@ def print_top_picks(df: pd.DataFrame):
 
 def export_results(df: pd.DataFrame, market: dict):
     """
-    CONSOLIDATED SINGLE EXCEL -- one file per scan containing all sheets.
-    Only generates the scan Excel if stocks were actually found.
-    Rejections CSV always exports (even if 0 stocks found) so you can debug.
+    SINGLE DAILY WORKBOOK - one file per day, one sheet per scan.
+
+    File:   ~/Downloads/scan_YYYY-MM-DD.xlsx   (e.g. scan_2026-04-30.xlsx)
+    Sheets added each scan:
+      Summary          - one row per scan, accumulates all day
+      Scan_HHMM        - full results for this specific scan
+      Rejections       - all blocked stocks (appends across scans)
+
+    Also writes scan_latest.xlsx (always current scan, single sheet).
+    Rejections CSV still appends all day as a separate file.
+
+    Nothing is deleted. Every scan adds a sheet. At end of day you have
+    one clean workbook with the full day's history inside.
     """
     try:
         import openpyxl
+        from openpyxl import load_workbook
     except ImportError:
-        print(f"  {C_YELLOW}[EXPORT] pip install openpyxl to enable Excel export{C_RESET}")
+        print(f"  {C_YELLOW}[EXPORT] pip install openpyxl{C_RESET}")
         _export_csv_only(df, market)
         return
 
     dl_dir = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(dl_dir, exist_ok=True)
     now   = datetime.now()
-    ts    = now.strftime("%Y-%m-%d_%H%M")
+    hhmm  = now.strftime("%H%M")
     today = now.strftime("%Y-%m-%d")
     rej   = market.get("rejected_detail", [])
 
-    # -- Always export rejections CSV (even if 0 stocks found) --
+    # ── Always export rejections CSV ──────────────────────────
     if len(rej) > 0:
-        rej_df   = pd.DataFrame(rej)
+        rej_df            = pd.DataFrame(rej)
         rej_df["scan_time"] = now.strftime("%H:%M:%S")
-        rej_path = os.path.join(dl_dir, f"rejections_log_{today}.csv")
-        rej_first = not os.path.exists(rej_path)
-        rej_df.to_csv(rej_path, mode="a", header=rej_first, index=False)
+        rej_path          = os.path.join(dl_dir, f"rejections_log_{today}.csv")
+        rej_df.to_csv(rej_path, mode="a",
+                      header=not os.path.exists(rej_path), index=False)
         print(f"  {C_GREEN}[EXPORT] Rejections ->{C_RESET} "
               f"rejections_log_{today}.csv  ({len(rej)} blocked)")
     else:
         rej_df = pd.DataFrame()
 
-    # -- Only write scan Excel if stocks were actually scanned --
     if df.empty:
-        print(f"  {C_YELLOW}[SKIP] No stocks passed filters -- scan Excel not generated.{C_RESET}")
-        print(f"  {C_DIM}  Rejections CSV still exported above for debugging.{C_RESET}")
+        print(f"  {C_YELLOW}[SKIP] No stocks passed filters -- "
+              f"daily workbook not updated.{C_RESET}")
         return
 
-    # -- CONSOLIDATED Excel: single file with all sheets --
+    # ── Daily workbook: scan_YYYY-MM-DD.xlsx ──────────────────
+    daily_path  = os.path.join(dl_dir, f"scan_{today}.xlsx")
+    scan_sheet  = f"Scan_{hhmm}"
+
     top     = df[df["alert"] == True]
     mkt_row = {
-        "Date":     today, "Time": now.strftime("%H:%M:%S"),
+        "Scan":     scan_sheet,
+        "Time":     now.strftime("%H:%M:%S"),
         "Regime":   market.get("regime","--"),
-        "SPY":      market.get("spy_price","--"), "SPY%": market.get("spy_dev",0),
-        "QQQ":      market.get("qqq_price","--"), "QQQ%": market.get("qqq_dev",0),
+        "SPY":      market.get("spy_price","--"),
+        "SPY%":     market.get("spy_dev",0),
+        "QQQ":      market.get("qqq_price","--"),
+        "QQQ%":     market.get("qqq_dev",0),
         "Scanned":  market.get("scanned",0),
         "Blocked":  market.get("blocked_count",0),
         "Signals":  len(top),
@@ -452,34 +560,84 @@ def export_results(df: pd.DataFrame, market: dict):
         "Universe": engine.UNIVERSE_MODE,
     }
 
-    def _write_xl(path):
-        with pd.ExcelWriter(path, engine="openpyxl") as w:
-            df.to_excel(w, sheet_name="Full Scan", index=False)
-            if not top.empty:
-                top.to_excel(w, sheet_name="Top Picks", index=False)
-            pd.DataFrame([mkt_row]).to_excel(w, sheet_name="Market Context", index=False)
-            if not rej_df.empty:
-                rej_df.to_excel(w, sheet_name="Rejected Stocks", index=False)
-            # Daily cumulative log as a sheet too
-            log_path = os.path.join(dl_dir, f"scan_log_{today}.csv")
-            if os.path.exists(log_path):
-                pd.read_csv(log_path).to_excel(w, sheet_name="Day Log", index=False)
+    # Load existing workbook or create fresh
+    if os.path.exists(daily_path):
+        wb = load_workbook(daily_path)
+    else:
+        wb = openpyxl.Workbook()
+        # Remove the default empty sheet
+        if "Sheet" in wb.sheetnames:
+            del wb["Sheet"]
 
-    fname_ts  = f"scan_{ts}.xlsx"
-    fname_now = "scan_latest.xlsx"
-    _write_xl(os.path.join(dl_dir, fname_ts))
-    _write_xl(os.path.join(dl_dir, fname_now))
-    print(f"\n  {C_GREEN}[EXPORT] Excel (all sheets) ->{C_RESET} {fname_ts}")
-    print(f"  {C_DIM}  Sheets: Full Scan . Top Picks . Market Context . "
-          f"Rejected Stocks . Day Log{C_RESET}")
+    # ── Sheet 1: Summary (one row per scan, always first) ──────
+    if "Summary" in wb.sheetnames:
+        ws_sum = wb["Summary"]
+        ws_sum.append(list(mkt_row.values()))
+    else:
+        ws_sum = wb.create_sheet("Summary", 0)
+        ws_sum.append(list(mkt_row.keys()))   # header
+        ws_sum.append(list(mkt_row.values())) # first data row
 
-    # -- Daily scan CSV log (appends all day) --
+    # ── Sheet 2+: Scan_HHMM (this scan's full results) ────────
+    # If sheet name already exists (re-run at same minute), overwrite it
+    if scan_sheet in wb.sheetnames:
+        del wb[scan_sheet]
+    ws_scan = wb.create_sheet(scan_sheet)
+
+    # Write column headers
+    cols = list(df.columns)
+    ws_scan.append(cols)
+    for _, row in df.iterrows():
+        ws_scan.append([
+            str(v) if isinstance(v, (list, dict, bool)) else
+            round(float(v), 6) if isinstance(v, float) else
+            int(v) if isinstance(v, (int,)) else v
+            for v in [row[c] for c in cols]
+        ])
+
+    # ── Rejections sheet (appends across all scans) ────────────
+    if not rej_df.empty:
+        rej_df_w = rej_df.copy()
+        if "Rejections" in wb.sheetnames:
+            ws_rej = wb["Rejections"]
+            for _, row in rej_df_w.iterrows():
+                ws_rej.append(list(row.values()))
+        else:
+            ws_rej = wb.create_sheet("Rejections")
+            ws_rej.append(list(rej_df_w.columns))
+            for _, row in rej_df_w.iterrows():
+                ws_rej.append(list(row.values()))
+
+    wb.save(daily_path)
+    sheets = [s for s in wb.sheetnames if s != "Summary"]
+    print(f"\n  {C_GREEN}[EXPORT] Daily workbook ->{C_RESET} "
+          f"scan_{today}.xlsx  "
+          f"({len(sheets)} scan(s) today  |  Sheet: {scan_sheet})")
+
+    # ── scan_latest.xlsx — always shows the most recent scan ──
+    latest_path = os.path.join(dl_dir, "scan_latest.xlsx")
+    with pd.ExcelWriter(latest_path, engine="openpyxl") as w:
+        df.to_excel(w, sheet_name="Latest Scan", index=False)
+        if not top.empty:
+            top.to_excel(w, sheet_name="Signals Only", index=False)
+        pd.DataFrame([mkt_row]).to_excel(w, sheet_name="Market Context", index=False)
+        if not rej_df.empty:
+            rej_df.to_excel(w, sheet_name="Rejected", index=False)
+    print(f"  {C_GREEN}[EXPORT] Latest ->{C_RESET} scan_latest.xlsx  (overwritten)")
+
+    # -- scan_log_DATE.csv: appending CSV all day ──────────────
+    # This is the SOURCE FILE for hypothesis testing.
+    # tag_outcomes reads this file to fetch actual outcomes.
+    # Contains every column from the scan including score,
+    # hurst_score, zscore, target, stop, price, alert, strategy.
     log_path = os.path.join(dl_dir, f"scan_log_{today}.csv")
     df_log   = df.copy()
     df_log["scan_time"] = now.strftime("%H:%M:%S")
-    first = not os.path.exists(log_path)
-    df_log.to_csv(log_path, mode="a", header=first, index=False)
-    print(f"  {C_GREEN}[EXPORT] Day log ->{C_RESET} scan_log_{today}.csv  (appended)")
+    df_log["scan_num"]  = getattr(run_scan, "_count", 1)
+    df_log.to_csv(log_path, mode="a",
+                  header=not os.path.exists(log_path), index=False)
+    print(f"  {C_GREEN}[EXPORT] Scan log ->{C_RESET} "
+          f"scan_log_{today}.csv  (appended for hypothesis testing)")
 
 
 def _export_csv_only(df: pd.DataFrame, market: dict):
