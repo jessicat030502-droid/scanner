@@ -47,9 +47,25 @@ except ImportError as e:
 import yfinance as yf
 
 # -- Storage paths ---------------------------------------------
-DL_DIR        = os.path.join(os.path.expanduser("~"), "Downloads")
-PROFILE_DIR   = os.path.join(DL_DIR, "ticker_profiles")
-BACKTEST_DIR  = os.path.join(DL_DIR, "backtests")
+# ── Storage paths -- imported from engine (single source of truth) ────────────
+# scanner_v4.py defines SCANNER_DIR, MARKOV_DATA_DIR, TICKER_PROFILE_DIR,
+# and DOWNLOADS_DIR. We import them here so both files always agree on locations.
+# If the import fails (engine not found), we fall back to sensible defaults.
+try:
+    SCANNER_DIR        = engine.SCANNER_DIR
+    MARKOV_DATA_DIR    = engine.MARKOV_DATA_DIR
+    TICKER_PROFILE_DIR = engine.TICKER_PROFILE_DIR
+    DOWNLOADS_DIR      = engine.DOWNLOADS_DIR
+except AttributeError:
+    # Fallback: research module running standalone without engine
+    SCANNER_DIR        = os.path.dirname(os.path.abspath(__file__))
+    MARKOV_DATA_DIR    = os.path.join(SCANNER_DIR, "markov_data")
+    TICKER_PROFILE_DIR = os.path.join(SCANNER_DIR, "ticker_profiles")
+    DOWNLOADS_DIR      = os.path.join(os.path.expanduser("~"), "Downloads")
+
+DL_DIR        = DOWNLOADS_DIR   # short alias used throughout this file
+PROFILE_DIR   = TICKER_PROFILE_DIR
+BACKTEST_DIR  = os.path.join(DOWNLOADS_DIR, "backtests")
 DAILY_LOG_DIR = DL_DIR
 os.makedirs(PROFILE_DIR,  exist_ok=True)
 os.makedirs(BACKTEST_DIR, exist_ok=True)
@@ -906,7 +922,12 @@ def append_scan_to_daily_excel(df: pd.DataFrame, market: dict,
 
 MARKOV_STATES = {0: "CALM", 1: "TRENDING", 2: "VOLATILE", 3: "RANGING"}
 
-MARKOV_MIN_DAYS     = 60    # minimum lookback for valid matrix
+MARKOV_MIN_DAYS     = 60    # minimum TRADING days for valid matrix
+                            # Run --prefetch --days 120 (not 60!) because:
+                            # 60 calendar days = ~42 trading days (after weekends+holidays)
+                            # 90 calendar days = ~63 trading days (barely passes)
+                            # 120 calendar days = ~84 trading days (solid margin)
+                            # Formula used: fetch = days*1.6+30 calendar days
 MARKOV_MIN_PROB     = 0.65  # stay-probability required to trade
 MARKOV_MIN_OBS      = 20    # minimum observations per state
 MARKOV_SPY_OVERRIDE = 0.02  # SPY vol above this always kills trade
@@ -977,86 +998,122 @@ def build_transition_matrix(symbol: str, days: int = 60,
     """
     Builds 4x4 Markov transition matrix from historical daily OHLCV.
 
-    Fixes vs original implementation:
-    1. Uses Wilder-smoothed ADX (matches scanner_v4.py)
-    2. Merges on date index to handle trading holidays correctly
-    3. Uses historically-informed sparse prior instead of uniform(0.25)
-    4. Caches result for MARKOV_CACHE_TTL seconds
+    THE CALENDAR vs TRADING DAY PROBLEM (why --days 60 always failed):
+      60 calendar days  = ~42 trading days  (weekends + holidays)
+      90 calendar days  = ~62 trading days
+      120 calendar days = ~83 trading days
 
-    Returns (matrix, counts, states_seq, valid).
-    matrix[i][j] = P(transition from state i to state j next day).
-    valid=False if insufficient data -- caller uses standard logic.
+    Additionally the ADX window (14 bars) consumes 14 observations.
+    So to end up with 60 USABLE observations after ADX:
+      Need at least 74 trading days in merged data
+      Need at least 105 calendar days to fetch reliably
+
+    This function now:
+      1. Fetches (days * 2 + 30) calendar days -- guarantees enough trading days
+         regardless of what `days` the user passes in
+      2. Does NOT truncate with .tail(days) -- keeps all available data
+      3. Gate 3 checks that min_len >= MARKOV_MIN_DAYS AFTER ADX window
+
+    DEFAULT: days=60 means "I want 60 usable trading days for the matrix"
+    The fetch automatically scales to provide that.
+
+    STRICT DATA REQUIREMENTS:
+      1. Raw yfinance rows >= MARKOV_MIN_DAYS (60)
+      2. After date-index merge with SPY >= MARKOV_MIN_DAYS trading days
+      3. After ADX 14-bar window: usable observations >= MARKOV_MIN_DAYS
     """
     import time as _t
+
+    # Cache check
     if use_cache and symbol in _markov_cache:
-        m, c, s, ts = _markov_cache[symbol]
-        if _t.time() - ts < MARKOV_CACHE_TTL:
-            return m, c, s, True
+        cached = _markov_cache[symbol]
+        if _t.time() - cached[3] < MARKOV_CACHE_TTL:
+            return cached[0], cached[1], cached[2], True, cached[4] if len(cached) > 4 else 0
 
+    # Fetch enough calendar days to guarantee MARKOV_MIN_DAYS trading days
+    # after ADX window.
+    # Formula: need (days + 14) trading days minimum.
+    # Trading days per calendar day ~ 0.71 (252/365).
+    # So calendar days needed = (days + 14) / 0.71 + 30 buffer
+    # Simplified: days * 2 + 30 always gives plenty of room.
+    fetch_cal = days * 2 + 30
     try:
-        df     = yf.Ticker(symbol).history(
-                     period=f"{days+30}d", interval="1d", auto_adjust=True)
-        spy_df = yf.Ticker("SPY").history(
-                     period=f"{days+30}d", interval="1d", auto_adjust=True)
-    except Exception as e:
-        print(f"  [MARKOV] Fetch failed {symbol}: {e}")
-        return None, None, [], False
+        import contextlib, io
+        with contextlib.redirect_stderr(io.StringIO()):
+            df     = yf.Ticker(symbol).history(
+                         period=f"{fetch_cal}d", interval="1d", auto_adjust=True)
+            spy_df = yf.Ticker("SPY").history(
+                         period=f"{fetch_cal}d", interval="1d", auto_adjust=True)
+    except Exception:
+        return None, None, [], False, 0
 
-    if df is None or df.empty or len(df) < MARKOV_MIN_DAYS:
-        return None, None, [], False
+    # Gate 1: raw row count
+    if df is None or df.empty:
+        return None, None, [], False, 0
+    raw_days = len(df)
+    if raw_days < MARKOV_MIN_DAYS:
+        return None, None, [], False, raw_days
 
+    # Normalise columns
     df.columns     = [c.lower() for c in df.columns]
     spy_df.columns = [c.lower() for c in spy_df.columns]
 
-    # Merge on date index -- avoids positional mismatch on holidays
+    # Gate 2: merged trading days -- date-index aligned to handle holidays
     df.index     = pd.DatetimeIndex(df.index).normalize()
     spy_df.index = pd.DatetimeIndex(spy_df.index).normalize()
-    merged = df.join(spy_df[["close"]], rsuffix="_spy", how="inner").tail(days)
+    # NO .tail(days) here -- that was the bug. Keep all fetched data.
+    # We want as many observations as possible for the ADX window.
+    merged = df.join(spy_df[["close"]], rsuffix="_spy", how="inner")
 
-    if len(merged) < MARKOV_MIN_DAYS:
-        return None, None, [], False
+    merged_days = len(merged)
+    if merged_days < MARKOV_MIN_DAYS:
+        return None, None, [], False, merged_days
 
     high  = merged["high"].values
     low   = merged["low"].values
     close = merged["close"].values
     spy_c = merged["close_spy"].values
 
+    # Wilder ADX -- 14-bar window consumes first 14 observations
     adx_arr  = _compute_wilder_adx(high, low, close, n=14)
     offset   = len(close) - len(adx_arr)
     spy_vols = np.abs(np.diff(spy_c)) / (spy_c[:-1] + 1e-9)
-    spy_vols = spy_vols[max(0, offset-1):]
+    spy_vols = spy_vols[max(0, offset - 1):]
 
-    min_len   = min(len(adx_arr), len(spy_vols))
-    adx_arr   = adx_arr[-min_len:]
-    spy_vols  = spy_vols[-min_len:]
-    dates     = [str(d)[:10] for d in merged.index[-min_len:]]
+    # Gate 3: usable observations AFTER ADX window must be >= MARKOV_MIN_DAYS
+    # This is what actually failed before: tail(60) -> ADX eats 14 -> 46 left
+    min_len = min(len(adx_arr), len(spy_vols))
+    if min_len < MARKOV_MIN_DAYS:
+        return None, None, [], False, min_len
 
-    if min_len < MARKOV_MIN_DAYS // 2:
-        return None, None, [], False
+    adx_arr  = adx_arr[-min_len:]
+    spy_vols = spy_vols[-min_len:]
+    dates    = [str(d)[:10] for d in merged.index[-min_len:]]
 
+    # Classify each day into a state
     states_seq = [
         (dates[i], classify_state(float(adx_arr[i]), float(spy_vols[i])))
         for i in range(min_len)
     ]
 
+    # Build 4x4 transition count matrix
     counts = np.zeros((4, 4), dtype=int)
     for i in range(len(states_seq) - 1):
-        counts[states_seq[i][1]][states_seq[i+1][1]] += 1
+        counts[states_seq[i][1]][states_seq[i + 1][1]] += 1
 
+    # Normalise rows -- blend with informed prior for sparse states
     matrix = np.zeros((4, 4), dtype=float)
     for i in range(4):
         row_sum = counts[i].sum()
         if row_sum >= MARKOV_MIN_OBS:
             matrix[i] = counts[i] / row_sum
         else:
-            # Blend data with informed prior weighted by available observations
             weight    = row_sum / MARKOV_MIN_OBS
             emp       = counts[i] / max(row_sum, 1)
             matrix[i] = weight * emp + (1 - weight) * MARKOV_SPARSE_PRIOR[i]
 
-    import time as _t2
-    _markov_cache[symbol] = (matrix, counts, states_seq, _t2.time())
-    return matrix, counts, states_seq, True
+    _markov_cache[symbol] = (matrix, counts, states_seq, _t.time(), min_len)
+    return matrix, counts, states_seq, True, min_len
 
 
 def compute_stationary_distribution(matrix: np.ndarray) -> np.ndarray:
@@ -1091,6 +1148,257 @@ def compute_nstep_matrix(matrix: np.ndarray, n_steps: int) -> np.ndarray:
     if matrix is None:
         return np.ones((4, 4)) / 4
     return np.linalg.matrix_power(matrix, max(1, n_steps))
+
+
+def compute_mean_recurrence_times(matrix: np.ndarray) -> np.ndarray:
+    """
+    Mean Recurrence Time (MRT) for each state: E[T_ii] = 1 / pi_i
+
+    From the document: "the expected number of days to return to a state
+    is 1/pi_i where pi_i is the steady-state probability."
+
+    Scanner application:
+      If pi(CALM) = 0.55, then MRT(CALM) = 1/0.55 = 1.82 days
+      Interpretation: on average, the CALM regime returns every 1.82 trading days.
+
+      This tells you how long to WAIT after a failed MR signal before
+      the regime becomes favorable again. If MRT(CALM) = 4 days,
+      you know the window will close for ~4 days before resetting.
+
+    Returns array of length 4: [MRT_CALM, MRT_TREND, MRT_VOLATILE, MRT_RANGING]
+    """
+    pi = compute_stationary_distribution(matrix)
+    # Avoid division by zero for states with near-zero stationary probability
+    mrt = np.where(pi > 1e-6, 1.0 / pi, np.inf)
+    return mrt
+
+
+def compute_mean_first_passage_times(matrix: np.ndarray) -> np.ndarray:
+    """
+    Mean First Passage Time (MFPT) matrix: m[i][j] = E[steps to reach j | start at i]
+
+    From the document (Did's answer expanded to matrix form):
+    "Enlarging the problem helps solving it -- consider not only t_C but also
+    t_S, t_G, t_GG and set up a linear system solved by the one-step Markov property."
+
+    This is exactly the system:
+      m[i][j] = 1 + sum_k P[i][k] * m[k][j]  for i != j
+      m[j][j] = MRT[j] = 1/pi_j
+
+    Solved as: (I - Q) * m_col = 1  for each target state j
+    where Q is P with row j zeroed out (making j absorbing).
+
+    Scanner application -- example for ALKT:
+      MFPT[TRENDING][CALM] = 3.2 days
+      Means: if currently in TRENDING, expect 3.2 more trading days
+             before CALM state (MR favorable) returns.
+      Use this to decide: "is it worth waiting for MR setup
+      or should I switch to TREND strategy now?"
+
+    Returns 4x4 matrix where m[i][j] = expected trading days
+    from state i to reach state j for the first time.
+    """
+    if matrix is None:
+        return np.full((4, 4), np.nan)
+
+    n    = matrix.shape[0]
+    mfpt = np.zeros((n, n))
+    pi   = compute_stationary_distribution(matrix)
+
+    for j in range(n):
+        # Mean recurrence time for j (diagonal entry)
+        mfpt[j][j] = 1.0 / pi[j] if pi[j] > 1e-6 else np.inf
+
+        # For i != j: solve (I - Q_j) m = 1
+        # where Q_j = P with row j replaced by zeros (j becomes absorbing)
+        Q_j = matrix.copy()
+        Q_j[j, :] = 0.0   # make state j absorbing for this computation
+
+        A   = np.eye(n) - Q_j
+        b   = np.ones(n)
+
+        try:
+            m_col = np.linalg.solve(A, b)
+            for i in range(n):
+                if i != j:
+                    mfpt[i][j] = float(m_col[i])
+        except np.linalg.LinAlgError:
+            # Singular matrix -- use stationary distribution fallback
+            for i in range(n):
+                if i != j:
+                    mfpt[i][j] = mfpt[j][j]
+
+    return mfpt
+
+
+def compute_absorption_times(matrix: np.ndarray,
+                               target_state: int,
+                               consecutive_days: int) -> dict:
+    """
+    Absorbing Markov chain fundamental matrix.
+
+    Directly from the document (amd's answer):
+    "Expand the state space to include all stages of completion of the pattern.
+    Model the last state as absorbing. Compute the fundamental matrix
+    N = (I - Q)^{-1}. The expected absorption times are t = N * 1."
+
+    Scanner application:
+      "How many trading days until the CALM state persists for
+      `consecutive_days` days in a row?"
+
+      Example: consecutive_days=3, target_state=0 (CALM)
+      Answers: "How many days until I get 3 consecutive CALM days?"
+      This is the expected time to a STABLE MR window.
+
+    States in augmented chain:
+      Original 4 states + (consecutive_days - 1) partial-match states + 1 absorbing
+
+    Returns dict with:
+      expected_days_from[i]: expected trading days from state i until absorption
+      fundamental_matrix:    full N matrix
+    """
+    if matrix is None or consecutive_days < 1:
+        return {}
+
+    n_orig   = matrix.shape[0]
+    n_partial = consecutive_days - 1   # stages of partial match
+    n_total  = n_orig + n_partial + 1  # original + partial + absorbing
+
+    # Build augmented transition matrix P'
+    # States 0..n_orig-1 : original Markov states
+    # States n_orig..n_orig+n_partial-1 : partial match (1,2,...,n_partial consecutive)
+    # State n_total-1 : absorbing (pattern complete)
+
+    P_aug = np.zeros((n_total, n_total))
+
+    # Original states: transition normally, EXCEPT
+    # if transitioning to target_state, advance to partial-match track
+    for i in range(n_orig):
+        for k in range(n_orig):
+            if k == target_state and n_partial > 0:
+                # First step toward pattern: go to partial-match state 0
+                P_aug[i][n_orig] += matrix[i][k]
+            elif k == target_state and n_partial == 0:
+                # Pattern length 1: go straight to absorbing
+                P_aug[i][n_total - 1] += matrix[i][k]
+            else:
+                P_aug[i][k] += matrix[i][k]
+
+    # Partial-match states: advancing through consecutive target days.
+    # Key insight from amd's document: when in partial-match state p,
+    # we ARE in the target_state. Next transition uses target_state's row.
+    # If next day is target_state: advance to p+1 (or absorb if last step).
+    # If next day is NOT target_state: fall back to that state directly.
+    # This correctly models self-overlapping patterns (3 consecutive days).
+    for p in range(n_partial):
+        state_idx  = n_orig + p
+        next_match = n_orig + p + 1 if p + 1 < n_partial else n_total - 1
+        for k in range(n_orig):
+            if k == target_state:
+                # Another consecutive target day -- advance
+                P_aug[state_idx][next_match] += matrix[target_state][k]
+            else:
+                # Broke the streak -- fall back to state k (original state)
+                P_aug[state_idx][k] += matrix[target_state][k]
+
+    # Absorbing state: stays absorbing
+    P_aug[n_total - 1][n_total - 1] = 1.0
+
+    # Q matrix: transient states only (all except absorbing)
+    n_transient = n_total - 1
+    Q = P_aug[:n_transient, :n_transient]
+
+    # Fundamental matrix N = (I - Q)^{-1}
+    try:
+        N = np.linalg.inv(np.eye(n_transient) - Q)
+    except np.linalg.LinAlgError:
+        return {"error": "Singular matrix -- chain may not be absorbing"}
+
+    # Expected absorption times: t = N * 1
+    t = N.sum(axis=1)
+
+    result = {
+        "target_state":       MARKOV_STATES.get(target_state, "UNKNOWN"),
+        "consecutive_days":   consecutive_days,
+        "expected_days_from": {},
+        "fundamental_matrix": N.tolist(),
+    }
+
+    # Expected days from each original state
+    for i in range(n_orig):
+        state_name = MARKOV_STATES.get(i, f"STATE_{i}")
+        result["expected_days_from"][state_name] = round(float(t[i]), 2)
+
+    # Expected days from partial-match states
+    for p in range(n_partial):
+        label = f"{MARKOV_STATES.get(target_state,'?')}x{p+1}_streak"
+        result["expected_days_from"][label] = round(float(t[n_orig + p]), 2)
+
+    return result
+
+
+def print_markov_timing_report(symbol: str, matrix: np.ndarray,
+                                current_state: int) -> dict:
+    """
+    Full timing report for one symbol's Markov chain.
+    Prints mean recurrence times, mean first passage times,
+    and absorption times for CALM consecutive streaks.
+
+    This answers:
+      1. How long before CALM returns? (MRT = 1/pi_CALM)
+      2. From current state, how many days to reach CALM? (MFPT)
+      3. How many days for 3 consecutive CALM days? (absorbing chain)
+
+    Called from run_markov_analysis().
+    """
+    if matrix is None:
+        return {}
+
+    report = {"symbol": symbol}
+
+    # Mean Recurrence Times
+    mrt = compute_mean_recurrence_times(matrix)
+    print(f"\n  Mean Recurrence Times (E[T_ii] = 1/pi_i):")
+    print(f"  How long until each regime returns on average:")
+    for i, name in MARKOV_STATES.items():
+        t = float(mrt[i])
+        current = " <- you are here" if i == current_state else ""
+        if t == np.inf:
+            print(f"    {name:<12} NEVER (never observed in data)")
+        else:
+            print(f"    {name:<12} {t:.1f} trading days{current}")
+    report["mean_recurrence_times"] = {
+        MARKOV_STATES[i]: round(float(mrt[i]), 2) if mrt[i] != np.inf else None
+        for i in range(4)
+    }
+
+    # Mean First Passage Times from current state to CALM (state 0)
+    mfpt = compute_mean_first_passage_times(matrix)
+    calm_col = mfpt[:, 0]
+    print(f"\n  Mean First Passage Times -> CALM state:")
+    print(f"  How many trading days from each state until CALM appears:")
+    for i, name in MARKOV_STATES.items():
+        t = float(calm_col[i])
+        current = " <- you are here" if i == current_state else ""
+        print(f"    {name:<12} {t:.1f} days to CALM{current}")
+    report["mfpt_to_calm"] = {
+        MARKOV_STATES[i]: round(float(calm_col[i]), 2) for i in range(4)
+    }
+
+    # Absorbing chain: how long for 3 consecutive CALM days (stable MR window)
+    abs3 = compute_absorption_times(matrix, target_state=0, consecutive_days=3)
+    if abs3 and "expected_days_from" in abs3:
+        print(f"\n  Expected days until 3 CONSECUTIVE CALM days (stable MR window):")
+        print(f"  Based on absorbing Markov chain (from document reference):")
+        for state_name, days in abs3["expected_days_from"].items():
+            current = " <- you are here" if state_name == MARKOV_STATES.get(current_state) else ""
+            print(f"    From {state_name:<16} {days:.1f} days{current}")
+        report["absorption_3_calm"] = abs3["expected_days_from"]
+
+    return report
+
+
+
 
 
 def simulate_price_paths(symbol: str, current_price: float,
@@ -1196,7 +1504,7 @@ def run_markov_analysis(symbols: list, days: int = 60,
         print(f"  {sym}")
         print(f"  {'='*55}")
 
-        matrix, counts, states_seq, valid = build_transition_matrix(
+        matrix, counts, states_seq, valid, data_days = build_transition_matrix(
             sym, days, use_cache=False)
         if not valid:
             print(f"  SKIPPED - < {MARKOV_MIN_DAYS} days available")
@@ -1315,7 +1623,15 @@ def run_markov_analysis(symbols: list, days: int = 60,
             personality = f"TREND FOLLOWER ({trend_p:.0%} TRENDING)"
         else:
             personality = f"MIXED (CALM={calm_p:.0%} TREND={trend_p:.0%})"
-        print(f"Long-run personality: {personality}")
+        print(f"  Long-run personality: {personality}")
+
+        # ── Timing analysis (MRT + MFPT + Absorbing chain) ────────────────
+        # From the Markov chain math document:
+        #   MRT  = 1/pi_i  (Ross: mean recurrence time)
+        #   MFPT = Did's linear system enlargement approach
+        #   Absorbing chain = amd's fundamental matrix N=(I-Q)^{-1}
+        print()
+        timing = print_markov_timing_report(sym, matrix, current_state)
 
         results[sym] = {
             "valid": True, "current_state": current_name,
@@ -1326,6 +1642,7 @@ def run_markov_analysis(symbols: list, days: int = 60,
             "nstep_probs": nstep_p.tolist(),
             "state_counts": sc, "total_days": total,
             "personality": personality,
+            "timing": timing,
         }
 
     out = os.path.join(DL_DIR, f"markov_{today}.json")
@@ -1339,20 +1656,21 @@ def run_markov_analysis(symbols: list, days: int = 60,
 
 def run_markov_gate_test(symbol: str, days: int = 60) -> dict:
     """
-    Compares backtest results with and without the Markov gate.
-    Run this BEFORE wiring Markov into scanner_v4.py.
-    Only adopt if Sharpe improves by >= 0.2.
+    Per-symbol Markov gate backtest.
+    Compares win rate and Sharpe with and without the gate.
+    Run --markov-gate-portfolio to test across all watchlist symbols.
 
     Usage:  python scanner_research_v4.py --markov-gate ALKT --days 60
     """
-    print("=" * 65)
+    print(f"\n{'='*65}")
     print(f"  MARKOV GATE BACKTEST  |  {symbol}  |  {days} days")
     print(f"{'='*65}")
 
-    matrix, counts, states_seq, valid = build_transition_matrix(
-        symbol, days, use_cache=False)
+    result5 = build_transition_matrix(symbol, days, use_cache=False)
+    matrix, counts, states_seq, valid, data_days = result5 if len(result5)==5 else (*result5, 0)
     if not valid:
-        print(f"  SKIPPED - insufficient data"); return {}
+        print(f"  SKIPPED -- insufficient data ({data_days} days, need {MARKOV_MIN_DAYS})")
+        return {}
 
     df_all = run_backtest([symbol], days=days,
                            strategy="MEAN_REVERSION", slippage_pct=0.001)
@@ -1370,7 +1688,8 @@ def run_markov_gate_test(symbol: str, days: int = 60) -> dict:
         n    = len(df)
         wr   = df["win"].sum() / n * 100
         av   = df["pnl_pct"].mean()
-        daily = df.groupby("entry_date")["pnl_pct"].sum()                 if "entry_date" in df.columns else pd.Series([0.0])
+        daily = df.groupby("entry_date")["pnl_pct"].sum() \
+                if "entry_date" in df.columns else pd.Series([0.0])
         sh = (daily.mean()/(daily.std()+1e-9))*np.sqrt(252) if len(daily)>3 else 0.0
         return {"n":n,"wr":round(wr,1),"sharpe":round(sh,2),"avg_pnl":round(av,4)}
 
@@ -1378,45 +1697,229 @@ def run_markov_gate_test(symbol: str, days: int = 60) -> dict:
     filt = sa["n"] - sg["n"]
     dwr  = sg["wr"] - sa["wr"]; dsh = sg["sharpe"] - sa["sharpe"]
 
-    print(f"{'Metric':<22} {'Without gate':>14} {'With gate':>14}")
+    print(f"\n  {'Metric':<22} {'Without gate':>14} {'With gate':>14}")
     print(f"  {'-'*52}")
     print(f"  {'Trades':<22} {sa['n']:>14} {sg['n']:>14}")
     print(f"  {'Win rate':<22} {sa['wr']:>13.1f}% {sg['wr']:>13.1f}%")
     print(f"  {'Sharpe':<22} {sa['sharpe']:>14.2f} {sg['sharpe']:>14.2f}")
     print(f"  {'Avg P&L':<22} {sa['avg_pnl']:>13.3f}% {sg['avg_pnl']:>13.3f}%")
-    print(f"Filtered: {filt} trades ({filt/max(sa['n'],1)*100:.0f}%)")
+    print(f"\n  Filtered: {filt} trades ({filt/max(sa['n'],1)*100:.0f}%)")
     print(f"  Win rate: {dwr:+.1f}%   Sharpe: {dsh:+.2f}")
 
-    if   dsh >= 0.2: print(f"VERDICT: ADOPT - Sharpe +{dsh:.2f}.")
-    elif dsh > 0:    print(f"VERDICT: MONITOR - +{dsh:.2f} (below 0.2). Re-test next month.")
-    else:            print(f"VERDICT: SKIP - gate hurts Sharpe ({dsh:.2f}).")
+    if   dsh >= 0.2:  verdict = f"ADOPT  -- Sharpe +{dsh:.2f}"
+    elif dsh > 0:     verdict = f"MONITOR -- +{dsh:.2f} (below 0.2). Re-test next month."
+    else:             verdict = f"SKIP   -- gate hurts Sharpe ({dsh:.2f})"
+    print(f"\n  VERDICT: {verdict}")
 
-    return {"without_gate":sa, "with_gate":sg, "sharpe_delta":dsh, "wr_delta":dwr}
+    return {"symbol": symbol, "without_gate": sa, "with_gate": sg,
+            "sharpe_delta": dsh, "wr_delta": dwr, "verdict": verdict}
+
+
+def run_markov_gate_portfolio(symbols: list = None, days: int = 60) -> dict:
+    """
+    CROSS-SECTIONAL Markov gate validation across all watchlist symbols.
+
+    This is the correct decision gate for MARKOV_GATE_ENABLED.
+    Per-symbol tests mislead: ALKT +0.46, GKOS -0.25 -> net unclear.
+
+    ADOPTION RULES (both must pass):
+      1. Average Sharpe delta >= 0.2  (meaningful improvement across the portfolio)
+      2. Negative outliers (dsh < -0.1) <= 20% of symbols  (no widespread harm)
+
+    VERDICTS:
+      ADOPT   -- both rules pass -> set MARKOV_GATE_ENABLED = True
+      PARTIAL -- rule 1 pass, rule 2 fail -> hurts specific symbols, investigate
+      MONITOR -- rule 1 fail, rule 2 pass -> improvement too small, wait
+      SKIP    -- both fail -> gate hurts performance, do not enable
+
+    Usage:  python scanner_research_v4.py --markov-gate-portfolio --days 60
+    """
+    symbols = symbols or engine.WATCHLIST
+
+    print(f"\n{'='*65}")
+    print(f"  MARKOV GATE PORTFOLIO VALIDATION")
+    print(f"  {len(symbols)} symbols  |  {days}-day lookback")
+    print(f"  Rule 1: avg Sharpe delta >= 0.2")
+    print(f"  Rule 2: negative outliers (dsh < -0.1) <= 20% of symbols")
+    print(f"{'='*65}\n")
+
+    results = []; skipped = []
+
+    for sym in symbols:
+        print(f"  {sym:<6}...", end=" ", flush=True)
+        result = run_markov_gate_test(sym, days=days)
+        if not result:
+            skipped.append(sym); print("SKIPPED"); continue
+        results.append(result)
+        dsh = result.get("sharpe_delta", 0)
+        print(f"dSharpe={dsh:+.2f}")
+
+    if not results:
+        print(f"\n  No valid results. Need {MARKOV_MIN_DAYS}+ days of data.")
+        return {}
+
+    deltas       = [r["sharpe_delta"] for r in results]
+    avg_delta    = float(np.mean(deltas))
+    med_delta    = float(np.median(deltas))
+    std_delta    = float(np.std(deltas))
+    n_positive   = sum(1 for d in deltas if d >= 0.2)
+    n_neutral    = sum(1 for d in deltas if 0 <= d < 0.2)
+    n_negative   = sum(1 for d in deltas if d < -0.1)
+    pct_negative = n_negative / len(deltas) * 100
+    results_sorted = sorted(results, key=lambda r: r["sharpe_delta"], reverse=True)
+
+    print(f"\n{'='*65}")
+    print(f"  CROSS-SECTIONAL RESULTS  ({len(results)} symbols)")
+    print(f"  {'Symbol':<8} {'dSharpe':>9} {'dWinRate':>9}  Verdict")
+    print(f"  {'-'*52}")
+    for r in results_sorted:
+        dsh = r["sharpe_delta"]; dwr = r["wr_delta"]
+        if dsh >= 0.2:   tag = "ADOPT"
+        elif dsh > 0:    tag = "MONITOR"
+        elif dsh > -0.1: tag = "MARGINAL"
+        else:            tag = "OUTLIER"
+        flag = " <-- NEGATIVE" if dsh < -0.1 else ""
+        print(f"  {r['symbol']:<8} {dsh:>+8.2f}  {dwr:>+8.1f}%  {tag}{flag}")
+
+    print(f"\n  ADOPT (>= +0.2):  {n_positive:>3} ({n_positive/len(deltas)*100:.0f}%)")
+    print(f"  MONITOR (0-0.2):  {n_neutral:>3} ({n_neutral/len(deltas)*100:.0f}%)")
+    print(f"  OUTLIER (< -0.1): {n_negative:>3} ({pct_negative:.0f}%)")
+    print(f"\n  Avg dSharpe: {avg_delta:+.3f}  Median: {med_delta:+.3f}  Std: {std_delta:.3f}")
+
+    rule1 = avg_delta >= 0.2
+    rule2 = pct_negative <= 20.0
+
+    print(f"\n  Rule 1 (avg >= 0.2): {avg_delta:+.3f}  {'PASS' if rule1 else 'FAIL'}")
+    print(f"  Rule 2 (outliers <= 20%): {pct_negative:.0f}%  {'PASS' if rule2 else 'FAIL'}")
+
+    if rule1 and rule2:
+        verdict = "ADOPT"
+        action  = "Set MARKOV_GATE_ENABLED = True. Then --backtest --days 30 to confirm."
+    elif rule1 and not rule2:
+        bad = [r["symbol"] for r in results if r["sharpe_delta"] < -0.1]
+        verdict = "PARTIAL"
+        action  = f"Helps overall but hurts {bad}. Investigate before enabling."
+    elif not rule1 and rule2:
+        verdict = "MONITOR"
+        action  = f"Improvement too small ({avg_delta:+.3f}). Re-test next month."
+    else:
+        verdict = "SKIP"
+        action  = "Gate hurts portfolio performance. Keep MARKOV_GATE_ENABLED = False."
+
+    print(f"\n  PORTFOLIO VERDICT: {verdict}")
+    print(f"  {action}")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    out   = os.path.join(DL_DIR, f"markov_portfolio_test_{today}.json")
+    summary = {
+        "date": today, "n_tested": len(results), "n_skipped": len(skipped),
+        "avg_delta": round(avg_delta,4), "med_delta": round(med_delta,4),
+        "std_delta": round(std_delta,4), "n_positive": n_positive,
+        "n_negative": n_negative, "pct_negative": round(pct_negative,1),
+        "rule1": rule1, "rule2": rule2, "verdict": verdict,
+        "per_symbol": results,
+    }
+    with open(out,"w") as f:
+        json.dump(summary, f, indent=2,
+                  default=lambda x: float(x) if hasattr(x,"__float__") else str(x))
+    print(f"\n  Saved -> {out}")
+    print(f"{'='*65}")
+    return summary
+
 
 
 def get_markov_gate(symbol: str, current_adx: float,
                      current_spy_vol: float, days: int = 60) -> tuple:
     """
     Single-call interface for scanner_v4.py integration.
-    Uses cached matrix -- safe to call on every symbol every scan.
+    Priority order for data source:
+      1. In-memory cache (_markov_cache) -- fastest, rebuilt hourly
+      2. Pre-built disk file (SCANNER_DIR/markov_data/SYMBOL.json)
+         from today's --prefetch run -- no yfinance call needed
+      3. Live yfinance fetch -- slowest, used as fallback only
 
     Returns (stable, stay_prob, stop_adj, reason).
 
-    Example in scan_symbol():
-      from scanner_research_v4 import get_markov_gate
-      stable, _, stop_adj, reason = get_markov_gate(symbol, adx_val, spy_ret)
-      if not stable: return None
-      stop_p = round(stop_p * stop_adj, 4)
+    The gate ONLY applies when 60+ days of valid data are available.
+    When data is insufficient: returns (True, 1.0, 1.0, reason)
+    so the signal passes through unchanged -- never penalises for lack of data.
     """
+    # -- Guardrail: SPY volatility override ------------------------
     if abs(current_spy_vol) > MARKOV_SPY_OVERRIDE:
-        return False, 0.0, 0.5, f"VOL_OVERRIDE: SPY vol {current_spy_vol:.1%} > 2%"
-    state  = classify_state(current_adx, current_spy_vol)
-    matrix, _, _, valid = build_transition_matrix(symbol, days, use_cache=True)
+        return (True, 1.0, 1.0,
+                f"VOL_OVERRIDE: SPY {current_spy_vol:+.1%} "
+                f"(trend day - Markov not applied)")
+
+    # -- Source 1: in-memory cache (fastest) -----------------------
+    import time as _t
+    if symbol in _markov_cache:
+        cached = _markov_cache[symbol]
+        if _t.time() - cached[3] < MARKOV_CACHE_TTL:
+            matrix    = cached[0]
+            data_days = cached[4] if len(cached) > 4 else 0
+            valid     = matrix is not None
+            if valid:
+                state    = classify_state(current_adx, current_spy_vol)
+                stable, stay_p, _ = is_state_stable(state, matrix)
+                stop_adj = get_stop_adjustment(state, matrix)
+                state_name = MARKOV_STATES.get(state, "UNKNOWN")
+                return (stable, stay_p, stop_adj,
+                        f"ACTIVE (cache): {state_name} "
+                        f"{'stable' if stable else 'unstable'} "
+                        f"{stay_p:.1%} ({data_days}d)")
+
+    # -- Source 2: pre-built disk file (fast, no yfinance) ---------
+    disk_matrix, disk_valid, disk_days, disk_reason = load_markov_from_disk(symbol)
+
+    if disk_valid and disk_matrix is not None:
+        # Store in memory cache so next call is instant
+        _markov_cache[symbol] = (disk_matrix, None, [], _t.time(), disk_days)
+        state    = classify_state(current_adx, current_spy_vol)
+        stable, stay_p, _ = is_state_stable(state, disk_matrix)
+        stop_adj = get_stop_adjustment(state, disk_matrix)
+        state_name = MARKOV_STATES.get(state, "UNKNOWN")
+        return (stable, stay_p, stop_adj,
+                f"ACTIVE (disk): {state_name} "
+                f"{'stable' if stable else 'unstable'} "
+                f"{stay_p:.1%} ({disk_days}d)")
+
+    # -- Disk file exists but has no data yet -- report gap --------
+    if disk_reason.startswith("NO_DATA"):
+        # Parse the days count from the reason string
+        parts     = disk_reason.split("_")
+        have_days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        needed    = MARKOV_MIN_DAYS - have_days
+        return (True, 1.0, 1.0,
+                f"NO_DATA: {have_days} days available "
+                f"(need {MARKOV_MIN_DAYS}, ~{needed} trading days more)")
+
+    # -- Source 3: live yfinance fetch (fallback) ------------------
+    # Only reaches here if: no cache, no disk file, or disk is stale
+    # During trading hours this means --prefetch was not run today
+    result = build_transition_matrix(symbol, days, use_cache=True)
+    if len(result) == 5:
+        matrix, counts, states_seq, valid, data_days = result
+    else:
+        matrix, counts, states_seq, valid = result
+        data_days = 0
+
     if not valid or matrix is None:
-        return True, 1.0, 1.0, "FALLBACK: insufficient data"
-    stable, stay_p, reason = is_state_stable(state, matrix)
+        if data_days > 0:
+            needed = MARKOV_MIN_DAYS - data_days
+            return (True, 1.0, 1.0,
+                    f"NO_DATA: only {data_days} days available "
+                    f"(need {MARKOV_MIN_DAYS}, ~{needed} trading days more)")
+        return (True, 1.0, 1.0,
+                f"NO_DATA: could not fetch history for {symbol}")
+
+    state    = classify_state(current_adx, current_spy_vol)
+    stable, stay_p, _ = is_state_stable(state, matrix)
     stop_adj = get_stop_adjustment(state, matrix)
-    return stable, stay_p, stop_adj, reason
+    state_name = MARKOV_STATES.get(state, "UNKNOWN")
+    return (stable, stay_p, stop_adj,
+            f"ACTIVE (live): {state_name} "
+            f"{'stable' if stable else 'unstable'} "
+            f"{stay_p:.1%} ({data_days}d)")
 
 
 # ===============================================================
@@ -1787,6 +2290,239 @@ def run_weekly_analysis() -> dict:
 # -- End Section 8 ---------------------------------------------
 
 
+# ===============================================================
+# SECTION 9 -- MARKOV DATA PREFETCH PIPELINE
+# ===============================================================
+#
+# PROBLEM BEING SOLVED
+# --------------------
+# Currently, when MARKOV_GATE_ENABLED = True and a signal fires,
+# the engine calls get_markov_gate() which calls
+# build_transition_matrix() which calls yf.Ticker().history()
+# LIVE during the scan. That means:
+#   - yfinance call on every alert during market hours
+#   - Counts against rate limits (already tight with 40 symbols)
+#   - Adds 0.5-2s latency per alert
+#   - The daily data doesn't change during the session anyway
+#
+# SOLUTION
+# --------
+# Run this ONCE before the market opens (8:30-9:00 AM):
+#   python scanner_research_v4.py --prefetch
+#
+# What it does:
+#   1. Fetches 90 days of daily OHLCV for every watchlist symbol + SPY
+#   2. Builds the full 4x4 Markov transition matrix for each symbol
+#   3. Saves matrices to SCANNER_DIR/markov_data/SYMBOL.json
+#   4. When engine calls get_markov_gate(), it reads from disk first
+#      (no yfinance call needed during the trading session)
+#   5. Falls back to live yfinance if disk file is stale (> 24h) or missing
+#
+# DAILY SCHEDULE (add to Task Scheduler after setup_tasks.bat):
+#   8:45 AM  --  python scanner_research_v4.py --prefetch
+#   9:00 AM  --  python scanner_terminal_v4.py --once
+#   9:30 AM  --  python scanner_terminal_v4.py --loop
+#
+# This ensures every symbol that will be scanned today has a fresh
+# Markov matrix ready before the first signal fires.
+# ===============================================================
+
+# Path where pre-built matrices are stored -- defined by engine.MARKOV_DATA_DIR
+# (imported at top of file from scanner_v4.py)
+
+
+def prefetch_markov_data(symbols: list = None, days: int = 120,
+                          force: bool = False) -> dict:
+    """
+    Pre-builds Markov transition matrices for all watchlist symbols.
+    Run once before market open at 5:45 AM PT. Saves to disk.
+
+    CRITICAL -- CALENDAR vs TRADING DAYS:
+      `days` = target trading days of usable data AFTER the ADX window.
+
+      The fetch formula is: calendar_days = days * 2 + 30
+      This guarantees enough trading days after weekends, holidays, ADX window.
+
+      Why --days 60 failed:
+        Old code fetched days+30=90 calendar days -> ~62 raw rows
+        Then tailed to 60 rows, then ADX ate 14 -> 46 usable  *** FAILED gate ***
+      Current code (fixed):
+        No .tail() -- keeps all fetched rows
+        fetch_cal = days*2+30 = plenty of margin
+        --days 60  -> 150 cal -> ~103 trading -> ~89 after ADX  PASS
+        --days 90  -> 210 cal -> ~144 trading -> ~130 after ADX PASS
+        --days 120 -> 270 cal -> ~186 trading -> ~172 after ADX PASS (recommended)
+
+      Minimum gate: 60 usable trading days (MARKOV_MIN_DAYS).
+      Default is 120 -- safe for all market conditions including holidays.
+
+    Args:
+        symbols:  list of ticker symbols. Defaults to engine.WATCHLIST.
+        days:     target trading days (default 120). Internally fetches ~2x calendar days.
+        force:    if True, rebuilds even if today's file already exists.
+
+    Usage:
+        python scanner_research_v4.py --prefetch              (120-day default)
+        python scanner_research_v4.py --prefetch --days 120   (same as default)
+        python scanner_research_v4.py --prefetch --force      (force full rebuild)
+    """
+    os.makedirs(MARKOV_DATA_DIR, exist_ok=True)
+    symbols = symbols or engine.WATCHLIST
+    today   = datetime.now().strftime("%Y-%m-%d")
+    summary = {}
+
+    # Calendar math -- show user exactly what's happening
+    fetch_cal   = days * 2 + 30
+    est_trading = int(fetch_cal * 0.71)
+    est_usable  = max(0, est_trading - 14)
+    print(f"\n{'='*65}")
+    print(f"  MARKOV DATA PREFETCH")
+    print(f"  Symbols: {len(symbols)}  |  Target: {days} trading days")
+    print(f"  Fetching: ~{fetch_cal} calendar days  ->  ~{est_trading} trading rows  ->  ~{est_usable} after ADX")
+    print(f"  Minimum required: {MARKOV_MIN_DAYS} usable days  |  {'WILL PASS' if est_usable >= MARKOV_MIN_DAYS else 'WARNING: TOO FEW DAYS -- use --days 120'}")
+    print(f"  Output: {MARKOV_DATA_DIR}")
+    if est_usable < MARKOV_MIN_DAYS:
+        print(f"\n  !! RECOMMENDATION: Use --days 120 to guarantee all symbols pass")
+        print(f"  !! Current: ~{est_usable} usable days < {MARKOV_MIN_DAYS} required")
+    print(f"  {'FORCED REBUILD' if force else 'Skipping symbols with fresh data'}")
+    print(f"{'='*65}\n")
+
+    passed = failed = skipped = 0
+
+    for i, sym in enumerate(symbols, 1):
+        out_path = os.path.join(MARKOV_DATA_DIR, f"{sym}.json")
+        progress = f"[{i:>2}/{len(symbols)}]"
+
+        # -- Skip if today's file already exists and not forcing ----
+        if not force and os.path.exists(out_path):
+            try:
+                existing = json.load(open(out_path))
+                if existing.get("fetch_date") == today and existing.get("valid"):
+                    data_days = existing.get("data_days", 0)
+                    print(f"  {progress} {sym:<6} SKIP  "
+                          f"(today's file exists, {data_days} days)")
+                    summary[sym] = existing
+                    skipped += 1
+                    continue
+            except Exception:
+                pass  # corrupt file -- rebuild it
+
+        print(f"  {progress} {sym:<6} fetching...", end=" ", flush=True)
+
+        # -- Build the matrix via research module -------------------
+        result = build_transition_matrix(sym, days=days, use_cache=False)
+        matrix, counts, states_seq, valid, data_days = result \
+            if len(result) == 5 else (*result, 0)
+
+        payload = {
+            "symbol":     sym,
+            "fetch_date": today,
+            "days":       days,
+            "valid":      valid,
+            "data_days":  data_days,
+        }
+
+        if valid and matrix is not None:
+            # Compute stationary distribution and store it too
+            pi   = compute_stationary_distribution(matrix)
+            sc   = {MARKOV_STATES[s]: 0 for s in range(4)}
+            for _, s in states_seq: sc[MARKOV_STATES[s]] += 1
+
+            payload.update({
+                "matrix":           matrix.tolist(),
+                "counts":           counts.tolist(),
+                "stationary":       pi.tolist(),
+                "state_counts":     sc,
+                "last_state":       states_seq[-1][1] if states_seq else 3,
+                "last_state_name":  MARKOV_STATES.get(
+                                        states_seq[-1][1] if states_seq else 3,
+                                        "RANGING"),
+            })
+            with open(out_path, "w") as f:
+                json.dump(payload, f)
+
+            last_state = payload["last_state_name"]
+            calm_pct   = float(pi[0]) * 100
+            trend_pct  = float(pi[1]) * 100
+            print(f"OK   {data_days}d  last={last_state:<10} "
+                  f"CALM={calm_pct:.0f}%  TREND={trend_pct:.0f}%")
+            passed += 1
+        else:
+            with open(out_path, "w") as f:
+                json.dump(payload, f)
+            print(f"FAIL  only {data_days} days "
+                  f"(need {MARKOV_MIN_DAYS})")
+            failed += 1
+
+        summary[sym] = payload
+        time.sleep(0.3)  # brief pause -- avoid rate limiting during batch
+
+    print(f"\n{'='*65}")
+    print(f"  PREFETCH COMPLETE")
+    print(f"  Passed: {passed}  |  Failed: {failed}  |  Skipped: {skipped}")
+    print(f"  Files saved to: {MARKOV_DATA_DIR}")
+
+    # Print which symbols are NOT ready
+    not_ready = [s for s, d in summary.items() if not d.get("valid", False)]
+    if not_ready:
+        print(f"\n  Symbols NOT yet at 60 days (Markov gate won't apply):")
+        for sym in not_ready:
+            dd = summary[sym].get("data_days", 0)
+            needed = MARKOV_MIN_DAYS - dd
+            print(f"    {sym:<6}  {dd} days  (~{needed} trading days more)")
+    else:
+        print(f"\n  All {passed} symbols have valid Markov matrices.")
+        print(f"  Set MARKOV_GATE_ENABLED = True in scanner_v4.py to activate.")
+    print(f"{'='*65}")
+
+    return summary
+
+
+def load_markov_from_disk(symbol: str) -> tuple:
+    """
+    Loads a pre-built Markov matrix from disk.
+    Returns (matrix, valid, data_days, last_state_name).
+
+    Called by get_markov_gate() BEFORE attempting a live yfinance fetch.
+    File must be from today (same fetch_date) to be considered fresh.
+
+    Returns (None, False, 0, "NO_DATA") if file doesn't exist,
+    is stale (not today's date), or failed validation during prefetch.
+    """
+    path  = os.path.join(MARKOV_DATA_DIR, f"{symbol}.json")
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if not os.path.exists(path):
+        return None, False, 0, "NO_FILE"
+
+    try:
+        data = json.load(open(path))
+    except Exception:
+        return None, False, 0, "CORRUPT_FILE"
+
+    # Stale: was built on a different day
+    if data.get("fetch_date") != today:
+        return None, False, 0, f"STALE_{data.get('fetch_date','')}"
+
+    # Was built today but didn't have enough data
+    if not data.get("valid", False):
+        data_days = data.get("data_days", 0)
+        needed    = MARKOV_MIN_DAYS - data_days
+        return None, False, data_days, f"NO_DATA_{data_days}d_need_{needed}_more"
+
+    # Valid -- reconstruct matrix from stored list
+    try:
+        matrix    = np.array(data["matrix"])
+        data_days = data.get("data_days", 0)
+        last_name = data.get("last_state_name", "UNKNOWN")
+        return matrix, True, data_days, f"DISK_OK_{data_days}d"
+    except Exception:
+        return None, False, 0, "MATRIX_PARSE_ERROR"
+
+
+# ── End Section 9 ─────────────────────────────────────────────
+
+
 # CLI ENTRY POINT
 # ===============================================================
 
@@ -1796,6 +2532,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 DAILY WORKFLOW COMMANDS:
+  Before market open (8:45 AM) -- run FIRST every day:
+    --prefetch              Build Markov matrices for all watchlist symbols
+    --prefetch --force      Force rebuild even if today's files exist
+    --prefetch --days 90    Use 90-day lookback (more state observations)
+
   After market close:
     --tag-outcomes DATE     Tag each signal as HIT_TARGET/HIT_STOP/OPEN
     --hypothesis DATE       Test which indicators actually predict wins
@@ -1805,7 +2546,7 @@ DAILY WORKFLOW COMMANDS:
     --backtest --days 30    Replay 30 days of history through the engine
     --sensitivity --days 20 Grid search on Z/SL/TP thresholds
     --consistency           Win rate by regime/ADX/Z-score buckets
-    --markov ALKT CRUS      Markov regime stability analysis
+    --markov ALKT CRUS      Full Markov regime analysis with GBM
     --markov-gate ALKT      Test whether Markov gate improves Sharpe
 
   Execution:
@@ -1815,12 +2556,19 @@ DAILY WORKFLOW COMMANDS:
     --profile ALKT CRUS --days 60   Build ticker personality profile
 """)
 
+    parser.add_argument("--prefetch",    action="store_true",
+                        help="Pre-build Markov matrices for all watchlist symbols")
+    parser.add_argument("--force",       action="store_true",
+                        help="Force rebuild even if today's prefetch files exist")
     parser.add_argument("--profile",       nargs="+", metavar="SYM")
     parser.add_argument("--backtest",      action="store_true")
     parser.add_argument("--sensitivity",   action="store_true")
     parser.add_argument("--consistency",   action="store_true")
     parser.add_argument("--markov",        nargs="+", metavar="SYM")
-    parser.add_argument("--markov-gate",   nargs="+", metavar="SYM")
+    parser.add_argument("--markov-gate",             nargs="+", metavar="SYM",
+                        help="Per-symbol gate backtest: --markov-gate ALKT --days 60")
+    parser.add_argument("--markov-gate-portfolio",   action="store_true",
+                        help="Cross-sectional gate test across all watchlist symbols")
     parser.add_argument("--tag-outcomes",  metavar="DATE",
                         help="Tag outcomes for DATE (e.g. 2026-04-30)")
     parser.add_argument("--hypothesis",    metavar="DATE",
@@ -1836,6 +2584,13 @@ DAILY WORKFLOW COMMANDS:
     parser.add_argument("--lookforward",   type=int, default=4,
                         help="Hours to look forward when tagging outcomes (default 4)")
     args = parser.parse_args()
+
+    if args.prefetch:
+        prefetch_markov_data(
+            symbols=engine.WATCHLIST,
+            days=args.days,
+            force=args.force,
+        )
 
     if args.profile:
         for sym in args.profile:
@@ -1860,6 +2615,12 @@ DAILY WORKFLOW COMMANDS:
             run_markov_gate_test(sym.upper(),
                                   days=max(args.days, MARKOV_MIN_DAYS))
 
+    if args.markov_gate_portfolio:
+        run_markov_gate_portfolio(
+            symbols=engine.WATCHLIST,
+            days=max(args.days, MARKOV_MIN_DAYS)
+        )
+
     if args.tag_outcomes:
         tag_outcomes(args.tag_outcomes,
                      lookforward_hours=args.lookforward)
@@ -1877,8 +2638,9 @@ DAILY WORKFLOW COMMANDS:
                                n_tranches=args.tranches,
                                interval_seconds=args.interval)
 
-    if not any([args.profile, args.backtest, args.sensitivity,
+    if not any([args.prefetch, args.profile, args.backtest, args.sensitivity,
                 args.consistency, args.markov, args.markov_gate,
+                args.markov_gate_portfolio,
                 args.tag_outcomes, args.hypothesis, args.weekly,
                 args.twap]):
         parser.print_help()
