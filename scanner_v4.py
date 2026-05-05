@@ -29,7 +29,20 @@ from dataclasses import dataclass
 from typing import Optional
 from scipy import stats as sp_stats
 import yfinance as yf
-import schedule
+try:
+    import schedule
+    _SCHEDULE_AVAILABLE = True
+except ImportError:
+    _SCHEDULE_AVAILABLE = False
+    # schedule is only used in the legacy run_universe_scan loop
+    # The main scanner uses scanner_terminal_v4.py --loop which doesn't need it
+
+try:
+    import ticker_intelligence as _ti
+    _TI_AVAILABLE = True
+except ImportError:
+    _ti = None
+    _TI_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
 
@@ -54,7 +67,19 @@ DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 
 try:
     import streamlit as st
-    STREAMLIT_MODE = True
+    # Only True when actually running inside `streamlit run`.
+    # Uses the official Streamlit runtime check.
+    # Guards against MagicMock (unit tests) by checking the actual module type.
+    _real_streamlit = hasattr(st, '__version__') and isinstance(getattr(st,'__version__',''), str)
+    if _real_streamlit:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+            _ctx = get_script_run_ctx()
+            STREAMLIT_MODE = _ctx is not None and hasattr(_ctx, 'session_id')
+        except Exception:
+            STREAMLIT_MODE = False
+    else:
+        STREAMLIT_MODE = False   # mock/stub -- not a real Streamlit session
 except ImportError:
     STREAMLIT_MODE = False
 
@@ -112,6 +137,21 @@ SECTOR_MAP = {
     "TROX":"XLB","RYAM":"XLB","KWR":"XLB",
     # Real Estate
     "NTST":"XLRE","EPRT":"XLRE","STAG":"XLRE",
+    # Dynamic watchlist additions (auto-populated by dynamic_watchlist.py)
+    # These are added to SECTOR_MAP so sector RS works correctly for dynamic symbols.
+    # Without this entry, dynamic symbols fall back to SPY which defeats the sector filter.
+    # Technology
+    "CEVA":"XLK","ICHR":"XLK","IDCC":"XLK",
+    # Consumer Discretionary
+    "CHEF":"XLY",
+    # Health Care
+    "ATRC":"XLV","OCUL":"XLV","PRCT":"XLV","TNDM":"XLV","NEOG":"XLV",
+    # Industrials
+    "FSTR":"XLI",
+    # Energy
+    "FLNC":"XLE",
+    # Financials
+    "FRST":"XLF",
 }
 
 UNIVERSE = list(dict.fromkeys([
@@ -1317,17 +1357,22 @@ def passes_liquidity_firewall(df_d: pd.DataFrame, symbol: str,
         return False, f"LOW_RELVOL {rel_vol:.2f}x < {min_rvol}x ({strategy})"
 
     # Gate 3: ATR% (movement potential -- will it move enough to pay?)
-    # Use recent daily range as ATR proxy (14-bar average true range)
+    # FIX: highs[1:]-closes[:-1] produces n-1 elements but highs-lows produces n.
+    # Fetch n+1 rows so [1:] slices align to exactly n elements.
+    atr_pct = 0.0
     if len(df_d) >= 14:
-        highs  = df_d["high"].values[-14:]
-        lows   = df_d["low"].values[-14:]
-        closes = df_d["close"].values[-14:]
-        tr     = np.maximum(highs - lows,
-                 np.maximum(np.abs(highs[1:] - closes[:-1]),
-                            np.abs(lows[1:] - closes[:-1]))) if len(highs) > 1 \
-                 else highs - lows
-        atr_val  = float(np.mean(tr[-13:])) if len(tr) >= 13 else float(np.mean(tr))
-        atr_pct  = atr_val / avg_price if avg_price > 0 else 0.0
+        highs  = df_d["high"].values[-15:]
+        lows   = df_d["low"].values[-15:]
+        closes = df_d["close"].values[-15:]
+        if len(highs) > 1:
+            hl  = highs[1:] - lows[1:]
+            hc  = np.abs(highs[1:] - closes[:-1])
+            lc  = np.abs(lows[1:]  - closes[:-1])
+            tr  = np.maximum(hl, np.maximum(hc, lc))
+        else:
+            tr  = highs - lows
+        atr_val = float(np.mean(tr)) if len(tr) > 0 else 0.0
+        atr_pct = atr_val / avg_price if avg_price > 0 else 0.0
         if atr_pct < min_atr_pct:
             return False, (f"LOW_ATR {atr_pct*100:.2f}% < {min_atr_pct*100:.1f}% "
                            f"(not enough daily range for {strategy})")
@@ -1416,6 +1461,26 @@ def get_strategy_regime(df_intra: pd.DataFrame, spy_return: float, adx: float = 
     spy_vol = abs(spy_return)
 
     # ── High volatility day: determine if directional or chaotic ─────────────
+    # Chaos check: use average per-bar range (ATR proxy), NOT session H-L span
+    # Session H-L on a 80-bar 5m df spans ~25%+ even on calm days (cumulative drift)
+    try:
+        if len(df_intra) > 10:
+            bar_ranges = df_intra["high"].values - df_intra["low"].values
+            avg_bar_range = float(np.nanmean(bar_ranges)) / float(df_intra["close"].iloc[0])
+        else:
+            avg_bar_range = spy_vol
+    except Exception:
+        avg_bar_range = spy_vol
+
+    # True chaos: high per-bar volatility (each bar is wild) AND near-zero net SPY return
+    # e.g. VIX spike, news whipsaw -- big swings each bar but no net direction
+    # Threshold: avg 5-min bar range > 1.5% (only occurs on real crash/VIX-spike days)
+    #            AND net SPY return < 0.5% (no clear direction despite the choppiness)
+    # Normal days: avg 5-min H-L range is ~0.1-0.3%. On a crash day it can be 1-2%.
+    if avg_bar_range > 0.015 and spy_vol < 0.005:
+        return ("NO_TRADE", 0.35, adx,
+                f"SPY_CHAOS avg_bar_range={avg_bar_range:.1%} net={spy_return:+.1%} - no trade")
+
     if spy_vol > SPY_VOL_NOTRADE:
         # Clean directional move (SPY up or down decisively) -> TREND
         # This handles the 3%+ gap-up/gap-down days correctly
@@ -1423,9 +1488,9 @@ def get_strategy_regime(df_intra: pd.DataFrame, spy_return: float, adx: float = 
             return ("TREND", 0.35, adx,
                     f"SPY {spy_return:+.1%} STRONG TREND DAY - trend mode active")
         else:
-            # High vol but no clear direction = true chaos (VIX spike, news whipsaw)
-            return ("NO_TRADE", 0.35, adx,
-                    f"SPY_CHAOS {spy_vol:.1%} vol, no direction - no trade")
+            # High vol but limited direction -- cautious but still tradeable
+            return ("TREND", 0.35, adx,
+                    f"SPY {spy_return:+.1%} elevated directional - trend mode")
 
     # ── Strong trend via ADX ──────────────────────────────────────────────────
     if adx > ADX_MAX:
@@ -1935,7 +2000,7 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         except Exception:
             pass  # research module not available -- trade normally
 
-    return {
+    _result = {
         "symbol":symbol,"price":round(price,2),"score":comp,"alert":alert_final,
         "mode":mode,"strategy":strategy,"exit_type":exit_type,
         "adx":adx_val,"regime_reason":regime_reason,"adaptive_ofi":adaptive_ofi,
@@ -1947,7 +2012,7 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         "hawkes_lam":lam,"hawkes_score":hawk_sc,"hawkes_sig":hawkes_signal(hawk_sc),
         "ofi":ofi,"ofi_delta":od,"ofi_score":o_sc,"ofi_sig":ofi_signal(ofi,od),
         "signed_ofi": round(float(signed_ofi) if 'signed_ofi' in locals() else 0.0, 4),
-        "market":market["regime"],"sector_etf":etf,
+        "market":market["regime"],"regime":market["regime"],"sector_etf":etf,
         "sector_rs":sec_rs,"sector_score":sec_sc,"sector_gate":sec_gate,
         "add_val":add_val,"add_bull":add_b,"add_score":round(add_score(add_b),1),
         "zscore":round(z,3),"zscore_score":round(zscore_score(z),1),"zscore_ok":z_ok,
@@ -1996,6 +2061,17 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         "universe_mode": UNIVERSE_MODE,
     }
 
+    # ── Ticker Intelligence: apply profile score adjustment ──────────────
+    # Adjusts composite score based on historical win rate for this symbol/strategy.
+    # Only fires when ticker_intelligence.py is available and has >= 5 trades on file.
+    if _TI_AVAILABLE:
+        try:
+            _result = _ti.patch_scan_symbol_with_profile(_result, symbol)
+        except Exception:
+            pass
+
+    return _result
+
 
 def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
     """
@@ -2005,17 +2081,40 @@ def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     global WATCHLIST
-    # Auto-refresh watchlist from file if it exists (§ watchlist updates every scan)
-    if symbols is WATCHLIST and os.path.exists("auto_watchlist.txt"):
-        try:
-            fresh = [s.strip().upper()
-                     for s in open("auto_watchlist.txt").read().split("\n")
-                     if s.strip()]
-            if fresh:
-                WATCHLIST = fresh
-                symbols   = fresh
-        except Exception:
-            pass
+    # Auto-refresh watchlist: priority order —
+    #   1. ticker_intelligence.build_active_watchlist() if available
+    #      (incorporates profile data, cooling, dynamic runners, RVOL bubbling)
+    #   2. auto_watchlist.txt if it exists (written by dynamic_watchlist.py)
+    #   3. engine.WATCHLIST fallback (always works)
+    if symbols is WATCHLIST:
+        if _TI_AVAILABLE:
+            try:
+                _wl, _wl_meta = _ti.build_active_watchlist(
+                    core=WATCHLIST,
+                    universe_csv_path=os.path.join(SCANNER_DIR, "current_universe.csv"),
+                    strategy_mode=STRATEGY_MODE,
+                    verbose=False,
+                )
+                if _wl:
+                    WATCHLIST = _wl
+                    symbols   = _wl
+            except Exception:
+                pass  # fall through to auto_watchlist.txt
+        if symbols is WATCHLIST:
+            # Fallback: plain auto_watchlist.txt
+            _auto_path = os.path.join(SCANNER_DIR, "auto_watchlist.txt")
+            if not os.path.exists(_auto_path):
+                _auto_path = "auto_watchlist.txt"
+            if os.path.exists(_auto_path):
+                try:
+                    fresh = [s.strip().upper()
+                             for s in open(_auto_path).read().split("\n")
+                             if s.strip()]
+                    if fresh:
+                        WATCHLIST = fresh
+                        symbols   = fresh
+                except Exception:
+                    pass
     market   = get_market_regime()
     results  = []
     rejected = []   # list of dicts: {symbol, reason, detail}
@@ -2103,6 +2202,16 @@ def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
         "rejected_detail": rejected,
         "active_strategy": active_strategy,  # actual per-scan strategy for display
     })
+
+    # ── Ticker Intelligence: record rejections + update profiles ──────────
+    # Persists rejection streaks, updates cooling list, updates ticker profiles.
+    # Runs asynchronously so it never delays the scan return.
+    if _TI_AVAILABLE and rejected:
+        try:
+            _ti.record_rejections(rejected)
+        except Exception:
+            pass
+
     if not results: return pd.DataFrame(), market
     df_raw = pd.DataFrame(results).sort_values(by=["score","bayes_prob"],
                                                 ascending=False).reset_index(drop=True)
@@ -2561,6 +2670,8 @@ def export_excel(df: pd.DataFrame, market: dict):
 # ── Scheduler & Background Threads ───────────────────────────────────────────
 
 def _scheduler_loop():
+    if not _SCHEDULE_AVAILABLE:
+        return
     schedule.every().day.at("09:00").do(lambda: run_universe_scan(30, "5m"))
     print("[SCHEDULER] Daily 9:00 AM scan scheduled")
     while True:
@@ -2569,13 +2680,22 @@ def _scheduler_loop():
 
 _started = False
 def _start_background():
+    """
+    Starts background threads for ADD breadth and scheduler.
+    Called automatically only when running as Streamlit dashboard.
+    NOT called on plain 'import scanner_v4' to avoid running universe scans
+    during terminal/research import.
+    """
     global _started
     if not _started:
         threading.Thread(target=_update_add_loop, daemon=True, name="add").start()
         threading.Thread(target=_scheduler_loop,  daemon=True, name="sched").start()
         _started = True
 
-_start_background()
+# Start background threads only when genuinely running inside Streamlit.
+# STREAMLIT_MODE is False when imported by terminal/research (real check above).
+if STREAMLIT_MODE:
+    _start_background()
 
 
 # ── Dashboard CSS ─────────────────────────────────────────────────────────────
@@ -2649,6 +2769,7 @@ hr{border-color:#e0e0e0!important;}
 # -- Dashboard --───────────────────────────────────────────────────────────────
 
 def run_dashboard():
+    _start_background()   # Start ADD loop + scheduler only when dashboard is live
     st.set_page_config(page_title="QUANT SCANNER v4", page_icon=None,
                        layout="wide", initial_sidebar_state="expanded")
     st.markdown(DASH_CSS, unsafe_allow_html=True)
@@ -3209,5 +3330,14 @@ def run_dashboard():
 if __name__ == "__main__":
     print("\n[QUANT v4] Run: python -m streamlit run scanner_v4.py\n")
 
-if STREAMLIT_MODE:
+# Run dashboard only when genuinely inside `streamlit run`.
+# Guard: check for the actual Streamlit script runner frame, not just mock.
+try:
+    from streamlit.runtime.scriptrunner import get_script_run_ctx as _get_ctx
+    _ctx = _get_ctx()
+    _is_real_streamlit = _ctx is not None and hasattr(_ctx, 'session_id')
+except Exception:
+    _is_real_streamlit = False
+
+if _is_real_streamlit:
     run_dashboard()
