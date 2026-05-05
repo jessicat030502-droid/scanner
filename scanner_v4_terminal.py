@@ -29,6 +29,14 @@ except ImportError as e:
     print("Make sure scanner_v4.py is in the same folder as this script.")
     sys.exit(1)
 
+# Ticker Intelligence layer
+try:
+    import ticker_intelligence as _ti
+    _TI_AVAILABLE = True
+except ImportError:
+    _ti = None
+    _TI_AVAILABLE = False
+
 import pandas as pd
 import numpy as np
 
@@ -711,6 +719,15 @@ COMMANDS:
     python scanner_terminal_v4.py --loop --interval 30
     python scanner_terminal_v4.py --loop --interval 120
 
+  Hybrid dynamic watchlist (recommended):
+    python scanner_terminal_v4.py --loop --dynamic
+    python scanner_terminal_v4.py --loop --dynamic --sync-interval 30
+    python scanner_terminal_v4.py --loop --dynamic --auto-sync
+    Adds high-RVOL/momentum runners to your core watchlist every hour.
+    --auto-sync automatically tightens to 30min sync when SPY moves >1.5%% today
+    or regime is RISK-OFF, reverts to 60min when market calms. No extra API calls.
+    Writes auto_watchlist.txt + current_universe.csv each sync.
+
   Change timeframe:
     python scanner_terminal_v4.py --tf 1m    # 1-minute bars
     python scanner_terminal_v4.py --tf 5m    # 5-minute (default)
@@ -765,6 +782,15 @@ def main():
                         help="Lock strategy: TREND | MEAN_REVERSION | AUTO")
     parser.add_argument("--no-color",  action="store_true",
                         help="Disable colors (for log files or basic terminals)")
+    parser.add_argument("--dynamic",       action="store_true",
+                        help="Enable hybrid dynamic watchlist (RVOL+momentum runners merged hourly)")
+    parser.add_argument("--auto-sync",    action="store_true", default=False,
+                        help="Auto-tighten universe sync to 30min when market is volatile "
+                             "(SPY move > 1.5%% today or RISK-OFF regime). "
+                             "Reverts to 60min when market calms. "
+                             "Only active when --dynamic is also set.")
+    parser.add_argument("--sync-interval", type=int, default=60,
+                        help="Minutes between dynamic watchlist refreshes (default 60)")
     args = parser.parse_args()
 
     # -- Apply CLI overrides --
@@ -813,24 +839,147 @@ def main():
         run_scan(args.tf)
         return
 
-    # Continuous loop
+    # ── Continuous loop ───────────────────────────────────────────────────────
+    # With --dynamic: runs generate_and_save() every --sync-interval minutes
+    # to refresh auto_watchlist.txt with high-RVOL + momentum runners.
+    # The file-read below then loads that merged list before each scan.
+    #
+    # Without --dynamic: same as before -- reads auto_watchlist.txt only if
+    # you wrote it manually (backward-compatible).
+
+    from datetime import timedelta
+
+    dynamic_enabled       = args.dynamic
+    sync_interval_min     = args.sync_interval      # current active interval (may auto-adjust)
+    sync_interval_base    = args.sync_interval      # user's baseline (30 or 60 from CLI)
+    sync_interval_volatile= max(15, args.sync_interval // 2)  # half of base, min 15 min
+    auto_sync_enabled     = args.auto_sync and args.dynamic   # only useful with --dynamic
+    _last_volatile_state  = None                              # track transitions to print once
+    last_sync_time        = datetime.min   # ensures first-scan sync when --dynamic
+
+    # Import dynamic generator (only needed with --dynamic, but safe to import always)
+    _dynamic_gen = None
+    if dynamic_enabled:
+        try:
+            import dynamic_watchlist as _dyn_mod
+            _dynamic_gen = _dyn_mod.generate_and_save
+            print(f"  {C_GREEN}[DYNAMIC]{C_RESET} Hybrid mode ON  "
+                  f"|  Sync every {sync_interval_min} min  "
+                  f"|  First sync will run before scan #1")
+        except ImportError:
+            print(f"  {C_YELLOW}[DYNAMIC] WARNING:{C_RESET} dynamic_watchlist.py not found. "
+                  f"Running in standard mode.")
+            dynamic_enabled = False
+
+    auto_wl_path = os.path.join(_dir, "auto_watchlist.txt")
+
+    # ── Ticker Intelligence startup ─────────────────────────────────────────
+    if _TI_AVAILABLE:
+        try:
+            # Bootstrap from any historical rejection CSVs (idempotent, fast on repeats)
+            _ti.bootstrap_from_historical_csvs()
+            # Print a brief intelligence report at startup
+            _intel_rpt = _ti.watchlist_intelligence_report(engine.WATCHLIST)
+            print(_intel_rpt)
+        except Exception as _ti_err:
+            print(f"  [TI] Intelligence layer init warning: {_ti_err}")
+
+    _auto_sync_note = (f"  | Auto-sync: ON (volatile={sync_interval_volatile}min, "
+                        f"calm={sync_interval_base}min)")  if auto_sync_enabled else ""
     print(f"  Auto-scan every {args.interval}s on {args.tf} bars. "
-          f"Universe: {engine.UNIVERSE_MODE}. Press Ctrl+C to stop.\n")
+          f"Universe: {engine.UNIVERSE_MODE}.{_auto_sync_note}  Press Ctrl+C to stop.\n")
     scan_count = 0
     while True:
         try:
-            # Reload watchlist from file every scan -- catches updates
-            if os.path.exists("auto_watchlist.txt"):
-                syms = [s.strip().upper()
-                        for s in open("auto_watchlist.txt").read().split("\n")
-                        if s.strip()]
-                if syms:
-                    engine.WATCHLIST = syms
+            now = datetime.now()
+
+            # ── Dynamic sync gate ──────────────────────────────────────────────
+            # Fires on first scan and then every sync_interval_min minutes.
+            # Writes auto_watchlist.txt -- the file-read below picks it up.
+            if dynamic_enabled and _dynamic_gen is not None:
+                due = (now - last_sync_time) > timedelta(minutes=sync_interval_min)
+                if due:
+                    print(f"\n  {C_CYAN}[SYNC]{C_RESET} "
+                          f"{now.strftime('%H:%M:%S')}  Refreshing universe "
+                          f"(RVOL + momentum screen)...")
+                    try:
+                        merged = _dynamic_gen(verbose=False)
+                        last_sync_time = now
+                        print(f"  {C_GREEN}[SYNC]{C_RESET} Universe updated: "
+                              f"{len(merged)} symbols  "
+                              f"(core + RVOL runners)  "
+                              f"-> auto_watchlist.txt")
+                    except Exception as _sync_err:
+                        print(f"  {C_YELLOW}[SYNC] WARNING:{C_RESET} "
+                              f"Dynamic sync failed: {_sync_err}")
+                        print(f"  Continuing with current watchlist.")
+
+            # ── Build active watchlist (intelligence-aware) ───────────────
+            # Priority: profile-sorted + cooling-aware > auto_watchlist.txt > WATCHLIST
+            if _TI_AVAILABLE:
+                try:
+                    _wl, _wl_meta = _ti.build_active_watchlist(
+                        core=engine.WATCHLIST,
+                        strategy_mode=engine.STRATEGY_MODE,
+                        verbose=False,
+                    )
+                    if _wl:
+                        engine.WATCHLIST = _wl
+                except Exception:
+                    pass  # fall through to file-based load
+            if not _TI_AVAILABLE:
+                if os.path.exists(auto_wl_path):
+                    syms = [s.strip().upper()
+                            for s in open(auto_wl_path).read().split("\n")
+                            if s.strip()]
+                    if syms:
+                        engine.WATCHLIST = syms
+                elif os.path.exists("auto_watchlist.txt"):
+                    syms = [s.strip().upper()
+                            for s in open("auto_watchlist.txt").read().split("\n")
+                            if s.strip()]
+                    if syms:
+                        engine.WATCHLIST = syms
 
             scan_count += 1
+            # Show cooled symbols if any
+            if _TI_AVAILABLE:
+                try:
+                    _cooled = _ti.CoolingList().all_cooled()
+                    _cooled_str = f"  | Cooled: {_cooled}" if _cooled else ""
+                except Exception:
+                    _cooled_str = ""
+            else:
+                _cooled_str = ""
             print(f"\n  -- Scan #{scan_count} --  "
-                  f"({len(engine.WATCHLIST)} symbols in watchlist)")
-            run_scan(args.tf)
+                  f"({len(engine.WATCHLIST)} symbols in watchlist){_cooled_str}")
+            _scan_df, _scan_market = run_scan(args.tf)
+
+            # ── Auto-sync: adjust universe refresh rate based on volatility ──
+            # Only active when --auto-sync flag is set. Zero impact otherwise.
+            # Checks market data returned by this scan -- no extra API calls.
+            if auto_sync_enabled and _scan_market:
+                _spy_move   = abs(_scan_market.get("spy_today", 0))   # today's SPY % move
+                _regime     = _scan_market.get("regime", "NEUTRAL")
+                _is_volatile = _spy_move > 1.5 or _regime == "RISK-OFF"
+
+                if _is_volatile and _last_volatile_state is not True:
+                    # Just became volatile -- tighten sync
+                    sync_interval_min   = sync_interval_volatile
+                    _last_volatile_state = True
+                    print(f"\n  {C_YELLOW}[AUTO-SYNC]{C_RESET} Market volatile "
+                          f"(SPY {_scan_market.get('spy_today',0):+.1f}%  "
+                          f"regime={_regime})  "
+                          f"-- universe sync tightened to {sync_interval_min}min")
+                elif not _is_volatile and _last_volatile_state is not False:
+                    # Just calmed down -- restore normal sync
+                    sync_interval_min   = sync_interval_base
+                    _last_volatile_state = False
+                    print(f"\n  {C_GREEN}[AUTO-SYNC]{C_RESET} Market calm "
+                          f"(SPY {_scan_market.get('spy_today',0):+.1f}%  "
+                          f"regime={_regime})  "
+                          f"-- universe sync restored to {sync_interval_min}min")
+
             print(f"\n  Next scan in {args.interval}s...  (Ctrl+C to stop)")
             time.sleep(args.interval)
         except KeyboardInterrupt:
