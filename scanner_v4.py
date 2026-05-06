@@ -21,7 +21,11 @@ New in v4:
 Cap filter: $300M-$20B. Timeframe: 15s / 1m / 5m / 15m toggle.
 """
 
-import os, time, math, warnings, threading
+import os, time, math, warnings, threading, json
+
+# Suppress Streamlit "missing ScriptRunContext" warning when run from CLI
+os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -53,6 +57,139 @@ warnings.filterwarnings("ignore")
 
 # Directory where scanner_v4.py lives (works regardless of where you launch from)
 SCANNER_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ── Learned weights loader ───────────────────────────────────────────────────
+# Checks C:\QuantScanner\learned_weights.json (written by --optimize-weights).
+# Only activates when file exists AND n_samples >= 60 AND activated == True.
+# Falls back silently to hardcoded weights if any condition fails.
+# This makes the transition from static -> adaptive completely safe.
+_LEARNED_WEIGHTS: dict = {}
+_learned_weights_path = os.path.join(SCANNER_DIR, "learned_weights.json")
+if os.path.exists(_learned_weights_path):
+    try:
+        with open(_learned_weights_path) as _lw_f:
+            _lw = json.load(_lw_f)
+        if _lw.get("activated") and _lw.get("n_samples", 0) >= 60:
+            _LEARNED_WEIGHTS = _lw
+            print(f"[WEIGHTS] Learned weights active "
+                  f"({_lw['n_samples']} samples, "
+                  f"CV={_lw.get('cv_accuracy',0):.1%})")
+    except Exception:
+        pass  # bad file -- silently use hardcoded weights
+
+def _print_weight_audit():
+    """
+    Prints a weight audit at startup.
+    Only runs when learned weights are active (silent in hardcoded mode).
+    Shows: active mode, sum check, top 3 contributors, excluded indicators.
+    """
+    if not _LEARNED_WEIGHTS:
+        return  # hardcoded weights -- no audit needed
+
+    print()
+    print("  ┌─────────────────────────────────────────────┐")
+    print("  │  WEIGHT AUDIT  (learned weights active)     │")
+    print("  └─────────────────────────────────────────────┘")
+    print(f"  Samples: {_LEARNED_WEIGHTS.get('n_samples','?')}  |  "
+          f"CV accuracy: {_LEARNED_WEIGHTS.get('cv_accuracy',0):.1%}  |  "
+          f"Activated: {_LEARNED_WEIGHTS.get('activated_date','?')[:10]}")
+
+    for strategy in ['TREND', 'MEAN_REVERSION']:
+        w = _get_weights(strategy)
+        total = sum(w.values())
+        top3  = sorted(w.items(), key=lambda x: x[1], reverse=True)[:3]
+        excluded = [k for k, v in w.items() if v == 0.0]
+
+        print(f"  {strategy}:")
+        print(f"    Weight sum:  {total:.6f}  {'OK' if abs(total-1.0)<0.001 else 'WARNING: not 1.0'}")
+        print(f"    Top 3:       " +
+              "  |  ".join(f"{k}={v:.1%}" for k,v in top3))
+        if excluded:
+            print(f"    Excluded:    {excluded}  (neg coef -- zeroed out)")
+        else:
+            print(f"    Excluded:    none")
+
+    print()
+
+def _get_weights(strategy: str) -> dict:
+    """
+    Returns indicator weights for the composite score formula.
+    Uses learned weights if available for this strategy, else hardcoded.
+    """
+    if not _LEARNED_WEIGHTS:
+        # Hardcoded defaults
+        if strategy == "TREND":
+            return {'hurst':0.12,'hawkes':0.20,'ofi':0.18,'sector':0.10,
+                    'add':0.12,'zscore':0.10,'ks':0.08,'bayes':0.10}
+        else:  # MEAN_REVERSION
+            return {'exhaustion':0.30,'ofi':0.20,'sector':0.15,
+                    'add':0.15,'ks':0.10,'bayes':0.10}
+
+    # Use regime-specific learned weights if available, else overall
+    regime_key = strategy if strategy in _LEARNED_WEIGHTS else "overall"
+    lw = _LEARNED_WEIGHTS.get(regime_key, {})
+    if not lw:
+        lw = _LEARNED_WEIGHTS.get("overall", {})
+
+    # Map learned weight keys to composite formula keys
+    KEY_MAP = {
+        'hurst_score':'hurst', 'hawkes_score':'hawkes', 'ofi_score':'ofi',
+        'sector_score':'sector', 'add_score':'add', 'zscore':'zscore',
+        'ks_score':'ks', 'bayes_prob':'bayes'
+    }
+    mapped = {KEY_MAP.get(k,k): v/100 for k,v in lw.items()
+              if not k.endswith('_signs')}  # skip meta keys
+
+    # Weights are already positive-only (negatives zeroed by optimizer).
+    # For safety: double-check using stored coef signs if available.
+    signs_key = (strategy if strategy in _LEARNED_WEIGHTS else "overall") + "_coef_signs"
+    coef_signs = _LEARNED_WEIGHTS.get(signs_key,
+                 _LEARNED_WEIGHTS.get("overall_coef_signs", {}))
+    if coef_signs:
+        for orig_col, sign in coef_signs.items():
+            mapped_col = KEY_MAP.get(orig_col, orig_col)
+            if sign < 0 and mapped_col in mapped:
+                mapped[mapped_col] = 0.0  # exclude harmful indicators
+
+    # Hardcoded defaults as fallback for any missing keys
+    defaults = {'hurst':0.12,'hawkes':0.20,'ofi':0.18,'sector':0.10,
+                'add':0.12,'zscore':0.10,'ks':0.08,'bayes':0.10}
+    for k, v in defaults.items():
+        if k not in mapped:
+            mapped[k] = v
+
+    # CRITICAL: normalize to sum=1.0 after merging.
+    # If any fallback key was added on top of learned weights that already sum
+    # to 1.0, the total exceeds 1.0 and every composite score inflates.
+    # Example: 7 learned keys (sum=1.0) + hurst fallback (0.12) = sum 1.12
+    # -> composite at avg indicator 70 scores 78.4 instead of 70.0
+    total = sum(mapped.values())
+    if total > 0 and abs(total - 1.0) > 0.001:
+        mapped = {k: v/total for k, v in mapped.items()}
+
+    return mapped
+
+# Print weight audit if learned weights are active
+_print_weight_audit()
+
+# ── Path integrity check ──────────────────────────────────────────────────────
+# All 7 scanner files must be in the same directory.
+# If any are missing, paths will scatter and cross-file reads will fail silently.
+_required_files = [
+    "scanner_v4.py", "scanner_terminal_v4.py", "scanner_research_v4.py",
+    "dynamic_watchlist.py", "ticker_intelligence.py",
+    "run_scheduler.py", "setup_tasks.bat",
+]
+_missing = [f for f in _required_files
+            if not os.path.exists(os.path.join(SCANNER_DIR, f))]
+if _missing:
+    import warnings
+    warnings.warn(
+        f"[SCANNER] Missing files in {SCANNER_DIR}: {_missing}\n"
+        f"All 7 files must be in the same folder. "
+        f"Paths will be inconsistent until resolved.",
+        stacklevel=2
+    )
 
 # Subfolder for Markov pre-built matrices -- created automatically on first prefetch
 # Location: same folder as scanner_v4.py / markov_data / ALKT.json
@@ -110,7 +247,7 @@ WATCHLIST = [
     # Energy (XLE)
     "REX","PTEN","WTTR","MTDR","GPOR",
     # Industrials (XLI)
-    "KTOS","ASTE","HLIO","DLX","HAYW","HEES",
+    "KTOS","ASTE","HLIO","DLX","HAYW",
     # Materials (XLB)
     "TROX","RYAM","KWR",
     # Real Estate (XLRE)
@@ -132,7 +269,7 @@ SECTOR_MAP = {
     # Energy
     "REX":"XLE","PTEN":"XLE","WTTR":"XLE","MTDR":"XLE","GPOR":"XLE",
     # Industrials
-    "KTOS":"XLI","ASTE":"XLI","HLIO":"XLI","DLX":"XLI","HAYW":"XLI","HEES":"XLI",
+    "KTOS":"XLI","ASTE":"XLI","HLIO":"XLI","DLX":"XLI","HAYW":"XLI",
     # Materials
     "TROX":"XLB","RYAM":"XLB","KWR":"XLB",
     # Real Estate
@@ -170,7 +307,7 @@ UNIVERSE = list(dict.fromkeys([
     "EXPO","EZPW","FARO","FBMS","FELE","FGEN","FISI","FLNC","FLR","FMBH",
     "FORM","FORR","FOXF","FRME","FRST","FSTR","FTDR","GDEN","GDOT","GEOS",
     "GIFI","GLDD","GLNG","GNSS","GNW","GPOR","GPRE","GRPN","GSBC","GSHD",
-    "GTLS","HAFC","HAIN","HALO","HASI","HBT","HCC","HCSG","HEES","HELE",
+    "GTLS","HAFC","HAIN","HALO","HASI","HBT","HCC","HCSG","HELE",
     "HFWA","HIBB","HIIQ","HIMX","HLX","HMST","HOPE","HROW","HRMY","HSII",
     "HTBK","HTLD","HTLF","HURC","HURN","HVT","HWKN","IART","IBTX","ICFI",
     "ICHR","IDCC","IDYA","IESC","IIPR","IMCR","INDB","INMD","INSM","IONS",
@@ -183,6 +320,24 @@ UNIVERSE = list(dict.fromkeys([
     "NMIH","NNBR","NOMD","NOVT","NSP","NTGR","NTRA","NWBI","NXRT","NYCB",
     "OBNK","OCFC","OCGN","OCSL","OCUL","OFG","OGS","OMCL","OPCH","OPRT",
 ]))
+
+# ── Optional: tickers.txt universe override ──────────────────────────────────
+# Add/remove symbols without editing Python. One symbol per line.
+# Lines starting with # are ignored. File: C:\QuantScanner\tickers.txt
+# If file doesn't exist, hardcoded UNIVERSE above is used unchanged.
+_tickers_path = os.path.join(SCANNER_DIR, "tickers.txt")
+if os.path.exists(_tickers_path):
+    try:
+        _file_syms = [
+            ln.split("#")[0].strip().upper()
+            for ln in open(_tickers_path).readlines()
+            if ln.split("#")[0].strip()
+        ]
+        if _file_syms:
+            UNIVERSE = list(dict.fromkeys(UNIVERSE + _file_syms))
+    except Exception:
+        pass  # bad file format -- keep hardcoded UNIVERSE
+
 
 # ── Universe Mode ────────────────────────────────────────────
 # WATCHLIST:   40-stock curated list   - fast, manual picks
@@ -1783,9 +1938,12 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         z_ok, _       = zscore_gate(z, direction_g)
         bayes_p, b_log = bayesian_win_prob(add_b, sec_gate, hawk_sc, z_ok, ks_sc)
 
+        _tw = _get_weights("TREND")
         raw = float(np.clip(
-            0.12*h_sc + 0.20*hawk_sc + 0.18*o_sc + 0.10*sec_sc +
-            0.12*add_score(add_b) + 0.10*zscore_score(z) + 0.08*ks_sc + 0.10*bayes_p*100,
+            _tw['hurst']*h_sc + _tw['hawkes']*hawk_sc + _tw['ofi']*o_sc +
+            _tw['sector']*sec_sc + _tw['add']*add_score(add_b) +
+            _tw['zscore']*zscore_score(z) + _tw['ks']*ks_sc +
+            _tw['bayes']*bayes_p*100,
             0, 100))
 
         # ── RVOL + ATR% participation multiplier (TREND) ──────
@@ -1875,9 +2033,11 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
                                + (30 if mr_long_sig or mr_short_sig else 0)
                                + (10 if vol_diverge else 0))
 
+        _mw = _get_weights("MEAN_REVERSION")
         raw  = float(np.clip(
-            0.30*exhaustion_score + 0.20*o_sc + 0.15*sec_sc +
-            0.15*add_score(add_b) + 0.10*ks_sc + 0.10*bayes_p*100,
+            _mw.get('exhaustion',0.30)*exhaustion_score + _mw['ofi']*o_sc +
+            _mw['sector']*sec_sc + _mw['add']*add_score(add_b) +
+            _mw['ks']*ks_sc + _mw['bayes']*bayes_p*100,
             0, 100))
 
         # ── ATR% range multiplier (MR) ─────────────────────────
@@ -2321,7 +2481,7 @@ def run_universe_scan(top_n: int = 30, timeframe: str = "5m") -> pd.DataFrame:
     if not results: return pd.DataFrame()
     df = pd.DataFrame(results).sort_values(by=["score","bayes_prob"],
                                             ascending=False).reset_index(drop=True)
-    with open("auto_watchlist.txt", "w") as f:
+    with open(os.path.join(SCANNER_DIR, "auto_watchlist.txt"), "w") as f:
         f.write("\n".join(df.head(top_n)["symbol"].tolist()))
     print(f"[UNIVERSE] Saved top {top_n} -> auto_watchlist.txt")
     export_excel(df, market)
@@ -2371,7 +2531,7 @@ RUSSELL2000_SYMBOLS = [
     "ASTE","ASTL","ATRI","AVAV","AVNT","AZTA","BATL","BCPC","BWXT","CIVI",
     "CLW","CMCO","CNSL","CRS","CSWI","CWST","DAN","DXPE","ECCA","ENVA",
     "EPAC","ERII","FBHS","FELE","FSTR","GATX","GFF","GHM","GLDD","GNRC",
-    "GTLS","HAYW","HEES","HLIO","HURC","HWKN","HYMC","IESC","ITRI","JBSS",
+    "GTLS","HAYW","HLIO","HURC","HWKN","HYMC","IESC","ITRI","JBSS",
     "KELYA","KTOS","KWR","LBAI","LCII","LCUT","LECO","LYTS","MATW","MATX",
     "MBIN","MCBC","MCRI","MDRX","MERC","MGPI","MNRO","MRTN","MRUS","MSEX",
     "MTDR","NNBR","NOMD","NOVT","NSP","OBNK","OSIS","PTEN","REX","RYAM",
@@ -2534,30 +2694,51 @@ def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
     Convert all columns to Excel-safe Python-native types.
     Fixes ArrowStringArray / ArrowDtype errors from pandas 2.0+ with PyArrow.
     openpyxl cannot serialize pyarrow-backed arrays -- must convert first.
+
+    Fix: forces every column out of the Arrow backend using .to_numpy(object)
+    before any further type conversion. This prevents 'ArrowStringArray is not
+    callable' errors that occur when .astype(str) stays in Arrow memory.
     """
     if df.empty:
         return df
-    out = df.copy()
-    for col in out.columns:
+    out = pd.DataFrame(index=df.index)  # fresh frame, no Arrow metadata
+    for col in df.columns:
         try:
-            dtype_str = str(out[col].dtype)
-            # ArrowDtype, ArrowStringArray, StringDtype, or any arrow-backed type
-            if "arrow" in dtype_str.lower() or "string" in dtype_str.lower():
-                out[col] = out[col].astype(str).where(out[col].notna(), None)
-            elif "bool" in dtype_str.lower():
-                out[col] = out[col].astype(bool)
-            elif "int" in dtype_str.lower():
-                out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
-            elif "float" in dtype_str.lower():
-                out[col] = pd.to_numeric(out[col], errors="coerce")
+            series = df[col]
+            dtype_str = str(series.dtype).lower()
+
+            # Step 1: Force out of Arrow/PyArrow backend unconditionally.
+            # .to_numpy(dtype=object) always returns a plain NumPy object array
+            # regardless of whether the underlying storage is Arrow or not.
+            raw = series.to_numpy(dtype=object, na_value=None)
+
+            # Step 2: Convert to appropriate Python-native type
+            if "bool" in dtype_str:
+                out[col] = pd.array(
+                    [bool(x) if x is not None else None for x in raw],
+                    dtype=object)
+            elif any(t in dtype_str for t in ("int", "uint")):
+                out[col] = pd.to_numeric(
+                    pd.Series(raw), errors="coerce").fillna(0).astype(int)
+            elif "float" in dtype_str:
+                out[col] = pd.to_numeric(pd.Series(raw), errors="coerce")
+            elif any(t in dtype_str for t in ("arrow", "string", "object")):
+                # Convert to plain Python str; preserve None for blank cells
+                out[col] = pd.array(
+                    [str(x) if x is not None else None for x in raw],
+                    dtype=object)
             else:
-                # Convert everything else to Python native
-                out[col] = out[col].apply(
-                    lambda x: str(x) if isinstance(x, (list, dict)) else x)
+                # Unknown dtype -- safest: stringify non-None, preserve None
+                out[col] = pd.array(
+                    [str(x) if x is not None and not isinstance(x, float)
+                     else x for x in raw],
+                    dtype=object)
         except Exception:
-            out[col] = out[col].astype(str)
-    # Final pass: replace any remaining non-serializable objects with strings
-    out = out.where(out.notna(), None)
+            # Nuclear fallback: stringify the entire column
+            try:
+                out[col] = df[col].astype(str).to_numpy(dtype=object)
+            except Exception:
+                out[col] = [str(v) for v in df[col].tolist()]
     return out
 
 
@@ -2633,14 +2814,19 @@ def export_excel(df: pd.DataFrame, market: dict):
     # Rejections sheet -- appends across all scans
     if not rejected.empty:
         rejected["scan_time"] = now.strftime("%H:%M:%S")
+        rej_clean = _sanitize_df(rejected)  # fix ArrowStringArray / ArrowDtype
+        def _safe_row(row):
+            return [str(v) if isinstance(v, (list, dict, bool))
+                    else round(float(v), 4) if isinstance(v, float)
+                    else v for v in row]
         if "Rejections" in wb.sheetnames:
-            for _, row in rejected.iterrows():
-                wb["Rejections"].append(list(row.values()))
+            for _, row in rej_clean.iterrows():
+                wb["Rejections"].append(_safe_row(list(row.values())))
         else:
             ws_r = wb.create_sheet("Rejections")
-            ws_r.append(list(rejected.columns))
-            for _, row in rejected.iterrows():
-                ws_r.append(list(row.values()))
+            ws_r.append(list(rej_clean.columns))
+            for _, row in rej_clean.iterrows():
+                ws_r.append(_safe_row(list(row.values())))
 
     wb.save(daily_path)
 
