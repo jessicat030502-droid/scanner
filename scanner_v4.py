@@ -556,8 +556,12 @@ MARKOV_GATE_ENABLED   = False
 STRATEGY_MODE      = "AUTO"
 
 # ── Mean Reversion Exit ───────────────────────────────────────
-MR_TAKE_PROFIT_PCT = 0.005
-MR_STOP_LOSS_PCT   = 0.008
+MR_TAKE_PROFIT_PCT = 0.005   # flat % TP (only used as floor; MR actually targets VWAP)
+MR_STOP_LOSS_PCT   = 0.008   # floor stop -- actual stop uses ATR*1.5 when available
+# R:R NOTE: flat TP=0.5% / SL=0.8% is inverted (need 73% win rate after slippage).
+# The scanner uses VWAP as MR target which is dynamically larger -- check your
+# rr_ratio column in scan_log. Trades with rr_ratio < 1.0 should be filtered.
+MR_MIN_RR_RATIO    = 1.0     # block MR entries where R:R < 1.0 (would need >50% WR)
 
 # ── ADX Regime ───────────────────────────────────────────────
 ADX_MAX            = 25
@@ -570,6 +574,79 @@ ADX_MAX            = 25
 SPY_VOL_NOTRADE    = 0.020
 SPY_VOL_CALM       = 0.005
 SPY_VOL_NORMAL     = 0.010
+
+# Parkinson shock detection: ratio of current Parkinson vol to baseline
+# 1.5 = current intraday vol is 50% above recent norm -> SHOCK state
+# 2.0 = severe shock (use for MR total block)
+# Self-calibrating: fires based on deviation not a fixed ATR% number
+PARKINSON_SHOCK_THRESHOLD  = 1.5   # ratio trigger: current/baseline > this
+PARKINSON_SHOCK_SEVERE     = 2.0   # severe: total MR block
+PARKINSON_SHOCK_COOLDOWN_M = 15    # minutes to keep MR blocked after shock clears
+
+# Runtime shock state (set by terminal scan loop, read by scan_symbol)
+# When True: scan_symbol() returns None for all MR signals (circuit breaker)
+_SHOCK_MR_OVERRIDE = False   # set externally by scanner_terminal_v4.py
+
+
+# ── Parkinson Volatility (High-Low based, scale-invariant) ──────────────────
+# More accurate than simple avg H-L range for shock detection because:
+#   1. Uses log(H/L)^2 -- normalized so a $5 stock and $500 stock are comparable
+#   2. Self-calibrating: compares current vol to its own rolling baseline
+#   3. Reacts to a single "nasty" candle faster than std deviation
+# Formula: sqrt( (1 / (4*n*ln2)) * sum(ln(H/L)^2) )
+# Returns (current_park_vol, baseline_park_vol, ratio, is_shock)
+
+def get_parkinson_vol(df: pd.DataFrame, window: int = 14,
+                      baseline_window: int = 100) -> tuple:
+    """
+    Computes Parkinson Volatility over the last `window` bars.
+    Uses High/Low prices -- captures intra-bar volatility missed by close-to-close.
+
+    Returns:
+        (current_vol, baseline_vol, ratio, is_shock)
+        ratio = current / baseline  (>1.5 = shock, >2.0 = severe shock)
+        is_shock = True when ratio > PARKINSON_SHOCK_THRESHOLD
+
+    Used by get_strategy_regime() to replace the hardcoded avg_bar_range > 1.5% check.
+    Self-calibrating: fires based on deviation from recent norm, not a fixed number.
+    """
+    if df is None or len(df) < window + 2:
+        return (0.0, 0.0, 1.0, False)
+
+    try:
+        h = df["high"].values.astype(float)
+        lo = df["low"].values.astype(float)
+
+        # Guard against zero or negative L/H
+        valid = (lo > 0) & (h > 0) & (h >= lo)
+        if valid.sum() < window:
+            return (0.0, 0.0, 1.0, False)
+
+        h_safe  = np.where(valid, h, np.nan)
+        lo_safe = np.where(valid, lo, np.nan)
+
+        log_hl_sq = np.log(h_safe / lo_safe) ** 2  # (ln H/L)^2
+
+        scale = 1.0 / (4.0 * window * np.log(2))
+
+        # Current window: last `window` bars
+        recent_sq = np.nansum(log_hl_sq[-window:])
+        current_vol = float(np.sqrt(scale * recent_sq))
+
+        # Baseline: rolling mean over last `baseline_window` bars
+        n_base = min(baseline_window, len(log_hl_sq))
+        base_sq = np.nansum(log_hl_sq[-n_base:]) / max(n_base // window, 1)
+        baseline_vol = float(np.sqrt(scale * base_sq)) if base_sq > 0 else current_vol
+
+        ratio = current_vol / baseline_vol if baseline_vol > 1e-9 else 1.0
+
+        is_shock = ratio > PARKINSON_SHOCK_THRESHOLD
+
+        return (round(current_vol, 6), round(baseline_vol, 6),
+                round(ratio, 3), is_shock)
+
+    except Exception:
+        return (0.0, 0.0, 1.0, False)
 
 
 # ── Range Filter (ThinkScript port) ──────────────────────────
@@ -1304,10 +1381,26 @@ def get_market_regime() -> dict:
     else:
         r, al, mm = "NEUTRAL",  True,  1.00
 
+    # Parkinson volatility shock check on SPY intraday bars
+    # Gives every scan access to current shock state via market dict
+    _park_v, _park_b, _park_r, _park_s = (0.0, 0.0, 1.0, False)
+    try:
+        _spy_5m = yf.download("SPY", period="1d", interval="5m",
+                               progress=False, auto_adjust=True)
+        if _spy_5m is not None and len(_spy_5m) > 16:
+            _spy_5m.columns = [c[0].lower() if isinstance(c, tuple) else c.lower()
+                                for c in _spy_5m.columns]
+            _park_v, _park_b, _park_r, _park_s = get_parkinson_vol(_spy_5m)
+    except Exception:
+        pass
+
     return {"regime": r, "allows_long": al, "mkt_mult": mm,
             "spy_price":  round(sp, 2), "spy_dev":  round(sd * 100, 2),
             "qqq_price":  round(qp, 2), "qqq_dev":  round(qd * 100, 2),
-            "spy_today":  round(spy_today * 100, 2)}
+            "spy_today":  round(spy_today * 100, 2),
+            "park_shock": _park_s,    # True when SPY Parkinson vol > 1.5x baseline
+            "park_ratio": round(_park_r, 3),  # ratio: current/baseline Parkinson vol
+            "park_vol":   round(_park_v, 6)}  # raw current Parkinson vol
 
 
 def get_sector_rs(etf: str) -> tuple:
@@ -1532,7 +1625,27 @@ def passes_liquidity_firewall(df_d: pd.DataFrame, symbol: str,
             return False, (f"LOW_ATR {atr_pct*100:.2f}% < {min_atr_pct*100:.1f}% "
                            f"(not enough daily range for {strategy})")
 
-    return True, f"OK DV=${dollar_vol/1e6:.1f}M RV={rel_vol:.2f}x ATR={atr_pct*100:.1f}%"
+    # Gate 4: Spread estimate (microstructure -- is the spread too wide to profit?)
+    # Estimated spread from High-Low range on recent bars. On small-caps,
+    # a wide spread destroys MR edge: 0.5% TP is worthless if spread is 0.3%.
+    # Threshold: spread > 0.3% blocks MR entries (TREND is more tolerant).
+    SPREAD_MAX_MR   = 0.003   # 0.3% -- MR needs tight spread to profit on 0.5% TP
+    SPREAD_MAX_TREND= 0.008   # 0.8% -- TREND can tolerate wider spread
+    spread_thresh   = SPREAD_MAX_MR if strategy == "MEAN_REVERSION" else SPREAD_MAX_TREND
+    try:
+        _highs  = df_d["high"].tail(5).values.astype(float)
+        _lows   = df_d["low"].tail(5).values.astype(float)
+        _closes = df_d["close"].tail(5).values.astype(float)
+        _closes = np.where(_closes > 0, _closes, 1.0)
+        est_spread = float(np.mean((_highs - _lows) / _closes))
+    except Exception:
+        est_spread = 0.0
+
+    if est_spread > spread_thresh and strategy == "MEAN_REVERSION":
+        return False, (f"WIDE_SPREAD {est_spread*100:.2f}% > {spread_thresh*100:.1f}% "
+                       f"(MR requires tight spread)")
+
+    return True, f"OK DV=${dollar_vol/1e6:.1f}M RV={rel_vol:.2f}x ATR={atr_pct*100:.1f}% SPR={est_spread*100:.2f}%"
 
 
 # ── ADX Calculation ───────────────────────────────────────────────────────────
@@ -1627,12 +1740,27 @@ def get_strategy_regime(df_intra: pd.DataFrame, spy_return: float, adx: float = 
     except Exception:
         avg_bar_range = spy_vol
 
-    # True chaos: high per-bar volatility (each bar is wild) AND near-zero net SPY return
-    # e.g. VIX spike, news whipsaw -- big swings each bar but no net direction
-    # Threshold: avg 5-min bar range > 1.5% (only occurs on real crash/VIX-spike days)
-    #            AND net SPY return < 0.5% (no clear direction despite the choppiness)
-    # Normal days: avg 5-min H-L range is ~0.1-0.3%. On a crash day it can be 1-2%.
-    if avg_bar_range > 0.015 and spy_vol < 0.005:
+    # ── Parkinson volatility shock detection (replaces hardcoded avg_bar_range) ─
+    # Self-calibrating: fires when current H-L vol is 1.5x+ its own recent baseline.
+    # Much more robust than a fixed 1.5% threshold -- works on any volatility regime.
+    park_vol, park_base, park_ratio, park_shock = get_parkinson_vol(df_intra)
+    park_severe = park_ratio > PARKINSON_SHOCK_SEVERE   # >2x = severe shock
+
+    # True chaos: Parkinson spike AND near-zero net SPY return (not a trend day)
+    # e.g. VIX spike, news whipsaw -- bars are wild but price goes nowhere
+    if park_shock and spy_vol < 0.005:
+        return ("NO_TRADE", 0.35, adx,
+                f"PARKINSON_CHAOS ratio={park_ratio:.2f}x (>{PARKINSON_SHOCK_THRESHOLD}x) "
+                f"net={spy_return:+.1%} - no trade")
+
+    # Severe shock even on directional day: issue TREND but with max strictness
+    # (park_severe = vol is 2x+ baseline -- very unusual, spreads are dangerous)
+    if park_severe and abs(spy_return) < 0.015:
+        return ("NO_TRADE", 0.35, adx,
+                f"PARKINSON_SEVERE ratio={park_ratio:.2f}x - extreme volatility, skip")
+
+    # Legacy fallback: keep the original avg_bar_range check as backup
+    if avg_bar_range > 0.015 and spy_vol < 0.005 and not park_shock:
         return ("NO_TRADE", 0.35, adx,
                 f"SPY_CHAOS avg_bar_range={avg_bar_range:.1%} net={spy_return:+.1%} - no trade")
 
@@ -1892,6 +2020,13 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
     if strategy == "NO_TRADE":
         return None
 
+    # Parkinson shock circuit breaker: block ALL new MR entries during/after shock.
+    # _SHOCK_MR_OVERRIDE is set True by scanner_terminal_v4.py when park_shock fires.
+    # Cleared automatically after PARKINSON_SHOCK_COOLDOWN_M minutes.
+    # This prevents "oversold but still crashing" MR traps during volatility spikes.
+    if strategy == "MEAN_REVERSION" and _SHOCK_MR_OVERRIDE:
+        return None  # MR circuit breaker active -- skip this symbol
+
     # ── FIREWALL 5: Sector RS ──────────────────────────────────
     # Two-tier sector filter:
     #   Hard block: RS < 0.95 -- sector is actively collapsing, no setup
@@ -2068,6 +2203,12 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         stop_p   = max(atr_stop, pct_stop)  # whichever is closer to price
         target  = vwap                                          # VWAP is the exit
         rr      = abs(vwap - price) / (price * MR_STOP_LOSS_PCT + 1e-9)
+
+        # R:R gate: block MR entries where VWAP is too close to price
+        # If VWAP ≈ price, reward is tiny relative to stop risk.
+        # MR_MIN_RR_RATIO=1.0 means reward must at least equal risk.
+        if alert and rr < MR_MIN_RR_RATIO:
+            alert = False  # suppress signal -- poor R:R, not worth the trade
         exit_type = "VWAP_TOUCH"
 
     # ── Shared post-processing ────────────────────────────────
@@ -2190,6 +2331,7 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         "intraday_ret":hd.get("intraday_ret",0.0),"gap_ret":hd.get("gap_ret",0.0),
         "below_vwap":hd.get("below_vwap",False),
         "mcap_b":mcap_b,"scanned_at":datetime.now().strftime("%H:%M:%S"),
+        "park_shock":market.get("park_shock",False),"park_ratio":round(market.get("park_ratio",1.0),3),
         # ── Dynamic VWAP bands ────────────────────────────────
         "vwap_upper1":   vwap_bands.get("upper1", vwap),
         "vwap_lower1":   vwap_bands.get("lower1", vwap),
