@@ -14,7 +14,46 @@ Imports all engine logic from scanner_v4.py - no duplication.
 Outputs terminal table + auto-exports to Excel/CSV on every scan.
 """
 
-import os, sys, time, argparse
+import os, sys, time, json, argparse
+
+# Suppress Streamlit "missing ScriptRunContext" warning when run from CLI
+os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+
+# ── Non-interactive logging ───────────────────────────────────────────────────
+# When running under Task Scheduler (headless, no terminal), stdout is not a
+# TTY. In that case, tee all print() output to a dated log file so you can
+# review what the scanner saw during the session.
+# When you run it interactively (watching), this does nothing.
+_SCANNER_DIR = os.path.dirname(os.path.abspath(__file__))
+_is_interactive = sys.stdout.isatty()
+
+if not _is_interactive:
+    import logging as _lg
+    _log_dir  = _SCANNER_DIR
+    _log_file = os.path.join(_log_dir,
+                             f"terminal_{datetime.now().strftime('%Y-%m-%d')}.log")
+    # Redirect stdout to BOTH file and original stdout (tee behaviour)
+    class _Tee:
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                try: s.write(data)
+                except Exception: pass
+        def flush(self):
+            for s in self.streams:
+                try: s.flush()
+                except Exception: pass
+        def isatty(self): return False
+
+    try:
+        _logfh  = open(_log_file, 'a', encoding='utf-8', errors='replace')
+        sys.stdout = _Tee(sys.stdout, _logfh)
+        sys.stderr = _Tee(sys.stderr, _logfh)
+        print(f"[LOG] Terminal output -> {_log_file}")
+    except Exception as _le:
+        pass  # if file can't be opened, just continue without file logging
 from datetime import datetime
 
 # -- Locate scanner_v4.py --
@@ -502,165 +541,94 @@ def print_top_picks(df: pd.DataFrame):
 
 def export_results(df: pd.DataFrame, market: dict):
     """
-    SINGLE DAILY WORKBOOK - one file per day, one sheet per scan.
-
-    File:   ~/Downloads/scan_YYYY-MM-DD.xlsx   (e.g. scan_2026-04-30.xlsx)
-    Sheets added each scan:
-      Summary          - one row per scan, accumulates all day
-      Scan_HHMM        - full results for this specific scan
-      Rejections       - all blocked stocks (appends across scans)
-
-    Also writes scan_latest.xlsx (always current scan, single sheet).
-    Rejections CSV still appends all day as a separate file.
-
-    Nothing is deleted. Every scan adds a sheet. At end of day you have
-    one clean workbook with the full day's history inside.
+    UNIFIED EXPORT -- calls engine.export_excel() for Excel files.
+    Terminal and Streamlit produce IDENTICAL output to ~/Downloads/:
+      scan_YYYY-MM-DD.xlsx    (daily workbook, one sheet per scan)
+      scan_latest.xlsx        (always most recent scan)
+      scan_log_DATE.csv       (rolling log -- source for --tag-outcomes)
+      rejections_log_DATE.csv (always written, even on 0-signal scans)
     """
-    try:
-        import openpyxl
-        from openpyxl import load_workbook
-    except ImportError:
-        print(f"  {C_YELLOW}[EXPORT] pip install openpyxl{C_RESET}")
-        _export_csv_only(df, market)
-        return
-
     dl_dir = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(dl_dir, exist_ok=True)
     now   = datetime.now()
-    hhmm  = now.strftime("%H%M")
     today = now.strftime("%Y-%m-%d")
     rej   = market.get("rejected_detail", [])
 
-    # ── Always export rejections CSV ──────────────────────────
+    # ── 1. Rejections CSV (always, even on 0-signal scans) ────
     if len(rej) > 0:
-        rej_df            = pd.DataFrame(rej)
+        rej_df = pd.DataFrame(rej)
         rej_df["scan_time"] = now.strftime("%H:%M:%S")
-        rej_path          = os.path.join(dl_dir, f"rejections_log_{today}.csv")
+        rej_path = os.path.join(dl_dir, f"rejections_log_{today}.csv")
         rej_df.to_csv(rej_path, mode="a",
                       header=not os.path.exists(rej_path), index=False)
         print(f"  {C_GREEN}[EXPORT] Rejections ->{C_RESET} "
               f"rejections_log_{today}.csv  ({len(rej)} blocked)")
-    else:
-        rej_df = pd.DataFrame()
 
+    # ── 2. scan_log CSV (always -- even 0-signal scans) ───────
+    # tag-outcomes reads this. Always exists so it never fails.
+    log_path = os.path.join(dl_dir, f"scan_log_{today}.csv")
     if df.empty:
-        print(f"  {C_YELLOW}[SKIP] No stocks passed filters -- "
-              f"daily workbook not updated.{C_RESET}")
+        empty_row = pd.DataFrame([{
+            "scan_time": now.strftime("%H:%M:%S"),
+            "scan_num":  getattr(run_scan, "_count", 1),
+            "regime":    market.get("regime", "--"),
+            "spy_today": market.get("spy_today", 0),
+            "scanned":   market.get("scanned", 0),
+            "blocked":   market.get("blocked_count", 0),
+            "note":      "no_signals_passed_filters",
+        }])
+        empty_row.to_csv(log_path, mode="a",
+                         header=not os.path.exists(log_path), index=False)
+        print(f"  {C_YELLOW}[SKIP] No signals.{C_RESET} "
+              f"rejections_log + scan_log written. Excel skipped.")
         return
 
-    # ── Daily workbook: scan_YYYY-MM-DD.xlsx ──────────────────
-    daily_path  = os.path.join(dl_dir, f"scan_{today}.xlsx")
-    scan_sheet  = f"Scan_{hhmm}"
+    # ── 3. Excel via engine.export_excel() ────────────────────
+    # Uses the SAME function as Streamlit -> identical format always.
+    # Writes scan_DATE.xlsx + scan_latest.xlsx to ~/Downloads/
+    try:
+        engine.export_excel(df, market)
+    except Exception as _xls_err:
+        print(f"  {C_YELLOW}[EXPORT] Excel error ({_xls_err}) -- CSV fallback{C_RESET}")
+        _export_csv_only(df, market)
 
-    top     = df[df["alert"] == True]
-    mkt_row = {
-        "Scan":     scan_sheet,
-        "Time":     now.strftime("%H:%M:%S"),
-        "Regime":   market.get("regime","--"),
-        "SPY":      market.get("spy_price","--"),
-        "SPY%":     market.get("spy_dev",0),
-        "QQQ":      market.get("qqq_price","--"),
-        "QQQ%":     market.get("qqq_dev",0),
-        "Scanned":  market.get("scanned",0),
-        "Blocked":  market.get("blocked_count",0),
-        "Signals":  len(top),
-        "Strategy": engine.STRATEGY_MODE,
-        "Universe": engine.UNIVERSE_MODE,
-    }
-
-    # Load existing workbook or create fresh
-    if os.path.exists(daily_path):
-        wb = load_workbook(daily_path)
-    else:
-        wb = openpyxl.Workbook()
-        # Remove the default empty sheet
-        if "Sheet" in wb.sheetnames:
-            del wb["Sheet"]
-
-    # ── Sheet 1: Summary (one row per scan, always first) ──────
-    if "Summary" in wb.sheetnames:
-        ws_sum = wb["Summary"]
-        ws_sum.append(list(mkt_row.values()))
-    else:
-        ws_sum = wb.create_sheet("Summary", 0)
-        ws_sum.append(list(mkt_row.keys()))   # header
-        ws_sum.append(list(mkt_row.values())) # first data row
-
-    # ── Sheet 2+: Scan_HHMM (this scan's full results) ────────
-    # If sheet name already exists (re-run at same minute), overwrite it
-    if scan_sheet in wb.sheetnames:
-        del wb[scan_sheet]
-    ws_scan = wb.create_sheet(scan_sheet)
-
-    # Write column headers
-    cols = list(df.columns)
-    ws_scan.append(cols)
-    for _, row in df.iterrows():
-        ws_scan.append([
-            str(v) if isinstance(v, (list, dict, bool)) else
-            round(float(v), 6) if isinstance(v, float) else
-            int(v) if isinstance(v, (int,)) else v
-            for v in [row[c] for c in cols]
-        ])
-
-    # ── Rejections sheet (appends across all scans) ────────────
-    if not rej_df.empty:
-        rej_df_w = rej_df.copy()
-        if "Rejections" in wb.sheetnames:
-            ws_rej = wb["Rejections"]
-            for _, row in rej_df_w.iterrows():
-                ws_rej.append(list(row.values()))
-        else:
-            ws_rej = wb.create_sheet("Rejections")
-            ws_rej.append(list(rej_df_w.columns))
-            for _, row in rej_df_w.iterrows():
-                ws_rej.append(list(row.values()))
-
-    wb.save(daily_path)
-    sheets = [s for s in wb.sheetnames if s != "Summary"]
-    print(f"\n  {C_GREEN}[EXPORT] Daily workbook ->{C_RESET} "
-          f"scan_{today}.xlsx  "
-          f"({len(sheets)} scan(s) today  |  Sheet: {scan_sheet})")
-
-    # ── scan_latest.xlsx — always shows the most recent scan ──
-    latest_path = os.path.join(dl_dir, "scan_latest.xlsx")
-    with pd.ExcelWriter(latest_path, engine="openpyxl") as w:
-        df.to_excel(w, sheet_name="Latest Scan", index=False)
-        if not top.empty:
-            top.to_excel(w, sheet_name="Signals Only", index=False)
-        pd.DataFrame([mkt_row]).to_excel(w, sheet_name="Market Context", index=False)
-        if not rej_df.empty:
-            rej_df.to_excel(w, sheet_name="Rejected", index=False)
-    print(f"  {C_GREEN}[EXPORT] Latest ->{C_RESET} scan_latest.xlsx  (overwritten)")
-
-    # -- scan_log_DATE.csv: appending CSV all day ──────────────
-    # This is the SOURCE FILE for hypothesis testing.
-    # tag_outcomes reads this file to fetch actual outcomes.
-    # Contains every column from the scan including score,
-    # hurst_score, zscore, target, stop, price, alert, strategy.
-    log_path = os.path.join(dl_dir, f"scan_log_{today}.csv")
-    df_log   = df.copy()
+    # ── 4. scan_log CSV (signals scan) ────────────────────────
+    df_log = df.copy()
     df_log["scan_time"] = now.strftime("%H:%M:%S")
     df_log["scan_num"]  = getattr(run_scan, "_count", 1)
     df_log.to_csv(log_path, mode="a",
                   header=not os.path.exists(log_path), index=False)
-    print(f"  {C_GREEN}[EXPORT] Scan log ->{C_RESET} "
-          f"scan_log_{today}.csv  (appended for hypothesis testing)")
+    print(f"  {C_GREEN}[EXPORT] Scan log ->{C_RESET} scan_log_{today}.csv")
 
 
 def _export_csv_only(df: pd.DataFrame, market: dict):
+    """
+    CSV fallback when openpyxl/ArrowStringArray fails Excel export.
+    Uses DAILY appending files (not per-scan timestamps) to prevent
+    clutter. Files match the same naming as the Excel export:
+      scan_log_YYYY-MM-DD.csv        (appends -- same as main scan_log)
+      rejections_log_YYYY-MM-DD.csv  (appends -- same as main rejections)
+    """
     dl_dir = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(dl_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M")
+    today = datetime.now().strftime("%Y-%m-%d")
+    now_s = datetime.now().strftime("%H:%M:%S")
+
     if not df.empty:
-        p = os.path.join(dl_dir, f"scan_{ts}.csv")
-        df.to_csv(p, index=False)
-        print(f"  {C_GREEN}[EXPORT] CSV ->{C_RESET} {p}")
-    rej = market.get("rejected_detail",[])
-    if len(rej) > 0:  # Fixed: was "if rej:" which fails on DataFrame
-        rp = os.path.join(dl_dir, f"rejected_{ts}.csv")
-        pd.DataFrame(rej).to_csv(rp, index=False)
-        print(f"  {C_GREEN}[EXPORT] Rejections CSV ->{C_RESET} {rp}")
+        # Append to the DAILY scan_log (same file as normal export)
+        p = os.path.join(dl_dir, f"scan_log_{today}.csv")
+        df_out = df.copy()
+        df_out["scan_time"] = now_s
+        df_out.to_csv(p, mode="a", header=not os.path.exists(p), index=False)
+        print(f"  {C_GREEN}[EXPORT] CSV ->{C_RESET} {p}  (appended)")
+
+    rej = market.get("rejected_detail", [])
+    if len(rej) > 0:
+        rp = os.path.join(dl_dir, f"rejections_log_{today}.csv")
+        rej_df = pd.DataFrame(rej)
+        rej_df["scan_time"] = now_s
+        rej_df.to_csv(rp, mode="a", header=not os.path.exists(rp), index=False)
+        print(f"  {C_GREEN}[EXPORT] Rejections CSV ->{C_RESET} {rp}  (appended)")
 
 
 def run_scan(timeframe: str = "5m"):
@@ -855,7 +823,19 @@ def main():
     sync_interval_volatile= max(15, args.sync_interval // 2)  # half of base, min 15 min
     auto_sync_enabled     = args.auto_sync and args.dynamic   # only useful with --dynamic
     _last_volatile_state  = None                              # track transitions to print once
-    last_sync_time        = datetime.min   # ensures first-scan sync when --dynamic
+    # Load last_sync_time from state file so restarts don't reset the timer
+    # Without this, restarting the scanner every 45min means the hourly sync never fires
+    _sync_state_path = os.path.join(_SCANNER_DIR, "universe_sync_state.json")
+    try:
+        with open(_sync_state_path) as _sf:
+            _ss = json.load(_sf)
+        _saved = _ss.get("last_sync_time", "")
+        last_sync_time = datetime.fromisoformat(_saved) if _saved else datetime.min
+        _age_min = (datetime.now() - last_sync_time).total_seconds() / 60
+        if _age_min > 120:          # stale (>2h old) -- force fresh sync
+            last_sync_time = datetime.min
+    except Exception:
+        last_sync_time = datetime.min   # normal on first runmic
 
     # Import dynamic generator (only needed with --dynamic, but safe to import always)
     _dynamic_gen = None
@@ -888,7 +868,8 @@ def main():
                         f"calm={sync_interval_base}min)")  if auto_sync_enabled else ""
     print(f"  Auto-scan every {args.interval}s on {args.tf} bars. "
           f"Universe: {engine.UNIVERSE_MODE}.{_auto_sync_note}  Press Ctrl+C to stop.\n")
-    scan_count = 0
+    scan_count       = 0
+    _shock_last_seen = datetime.min   # tracks when last Parkinson shock was seen
     while True:
         try:
             now = datetime.now()
@@ -905,6 +886,12 @@ def main():
                     try:
                         merged = _dynamic_gen(verbose=False)
                         last_sync_time = now
+                        # Persist so restarts don't reset the timer
+                        try:
+                            with open(_sync_state_path, "w") as _sf2:
+                                json.dump({"last_sync_time": now.isoformat()}, _sf2)
+                        except Exception:
+                            pass
                         print(f"  {C_GREEN}[SYNC]{C_RESET} Universe updated: "
                               f"{len(merged)} symbols  "
                               f"(core + RVOL runners)  "
@@ -940,6 +927,34 @@ def main():
                             if s.strip()]
                     if syms:
                         engine.WATCHLIST = syms
+
+            # ── Parkinson shock cooldown (MR circuit breaker) ─────────────────
+            # If Parkinson vol shock is active OR was active within the last
+            # PARKINSON_SHOCK_COOLDOWN_M minutes, block new MR entries.
+            # MR signals are "radioactive" for 15min after a vol spike clears.
+            _mkt_shock = _market.get("park_shock", False) if hasattr(engine, "_market")                          else False
+            try:
+                _mkt_shock = engine._last_market.get("park_shock", False)
+            except Exception:
+                _mkt_shock = False
+
+            if _mkt_shock:
+                _shock_last_seen = now
+
+            _mins_since_shock = (now - _shock_last_seen).total_seconds() / 60                                  if _shock_last_seen else 999
+            _in_shock_cooldown = _mins_since_shock < engine.PARKINSON_SHOCK_COOLDOWN_M
+
+            if _mkt_shock or _in_shock_cooldown:
+                _cd_str = (f"[SHOCK ACTIVE]" if _mkt_shock else
+                           f"[SHOCK COOLDOWN {_mins_since_shock:.0f}m ago]")
+                print(f"  {C_RED}{_cd_str}{C_RESET} MR entries blocked. "
+                      f"New MR signals will resume {engine.PARKINSON_SHOCK_COOLDOWN_M}min "
+                      f"after volatility normalizes.")
+                # Override: force TREND-only mode during shock window
+                engine._SHOCK_MR_OVERRIDE = True   # scan_symbol circuit breaker
+
+            else:
+                engine._SHOCK_MR_OVERRIDE = False  # cooldown expired, MR restored
 
             scan_count += 1
             # Show cooled symbols if any
