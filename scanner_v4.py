@@ -69,7 +69,15 @@ if os.path.exists(_learned_weights_path):
     try:
         with open(_learned_weights_path) as _lw_f:
             _lw = json.load(_lw_f)
-        if _lw.get("activated") and _lw.get("n_samples", 0) >= 60:
+        _cv_chk   = _lw.get("cv_accuracy", 0)
+        _nsmp_chk = _lw.get("n_samples", 0)
+        # Reject if CV=100% on small sample -- memorized one regime, not real edge
+        if _cv_chk >= 0.995 and _nsmp_chk < 500:
+            print(f"[WEIGHTS] Overfit guard: CV={_cv_chk:.1%} on {_nsmp_chk} samples "
+                  f"-- rejecting, using hardcoded weights.")
+            print(f"[WEIGHTS] Delete learned_weights.json and re-run "
+                  f"--optimize-weights after more diverse data.")
+        elif _lw.get("activated") and _nsmp_chk >= 60:
             _LEARNED_WEIGHTS = _lw
             print(f"[WEIGHTS] Learned weights active "
                   f"({_lw['n_samples']} samples, "
@@ -119,8 +127,9 @@ def _get_weights(strategy: str) -> dict:
     if not _LEARNED_WEIGHTS:
         # Hardcoded defaults
         if strategy == "TREND":
-            return {'hurst':0.12,'hawkes':0.20,'ofi':0.18,'sector':0.10,
-                    'add':0.12,'zscore':0.10,'ks':0.08,'bayes':0.10}
+            # Zscore/Hurst 0.95 correlated -- reduced zscore, boosted hawkes
+            return {'hurst':0.12,'hawkes':0.26,'ofi':0.18,'sector':0.10,
+                    'add':0.12,'zscore':0.04,'ks':0.08,'bayes':0.10}
         else:  # MEAN_REVERSION
             return {'exhaustion':0.30,'ofi':0.20,'sector':0.15,
                     'add':0.15,'ks':0.10,'bayes':0.10}
@@ -152,8 +161,9 @@ def _get_weights(strategy: str) -> dict:
                 mapped[mapped_col] = 0.0  # exclude harmful indicators
 
     # Hardcoded defaults as fallback for any missing keys
-    defaults = {'hurst':0.12,'hawkes':0.20,'ofi':0.18,'sector':0.10,
-                'add':0.12,'zscore':0.10,'ks':0.08,'bayes':0.10}
+    # Zscore/Hurst 0.95 correlated -- reduced zscore, boosted hawkes
+    defaults = {'hurst':0.12,'hawkes':0.26,'ofi':0.18,'sector':0.10,
+                'add':0.12,'zscore':0.04,'ks':0.08,'bayes':0.10}
     for k, v in defaults.items():
         if k not in mapped:
             mapped[k] = v
@@ -254,71 +264,191 @@ WATCHLIST = [
     "NTST","EPRT","STAG",
 ]
 
+# BASE SECTOR MAP (static + dynamic watchlist additions)
+# ───────────────────────────────────────────────────────────────
 SECTOR_MAP = {
-    # Technology
+    # Technology (XLK)
     "CRUS":"XLK","POWI":"XLK","ALKT":"XLK","TASK":"XLK",
     "IRTC":"XLK","APPF":"XLK",
-    # Consumer
+
+    # Consumer Discretionary (XLY)
     "BOOT":"XLY","GIII":"XLY","PLAY":"XLY","HIMS":"XLY",
     "DXLG":"XLY","EAT":"XLY",
-    # Healthcare
+
+    # Healthcare (XLV)
     "ACAD":"XLV","INVA":"XLV","NVCR":"XLV","GKOS":"XLV",
     "IMVT":"XLV","KRYS":"XLV",
-    # Financials
+
+    # Financials (XLF)
     "OPFI":"XLF","GCMG":"XLF","NRDS":"XLF","ENVA":"XLF","ECPG":"XLF",
-    # Energy
+
+    # Energy (XLE)
     "REX":"XLE","PTEN":"XLE","WTTR":"XLE","MTDR":"XLE","GPOR":"XLE",
-    # Industrials
+
+    # Industrials (XLI)
     "KTOS":"XLI","ASTE":"XLI","HLIO":"XLI","DLX":"XLI","HAYW":"XLI",
-    # Materials
+
+    # Materials (XLB)
     "TROX":"XLB","RYAM":"XLB","KWR":"XLB",
-    # Real Estate
+
+    # Real Estate (XLRE)
     "NTST":"XLRE","EPRT":"XLRE","STAG":"XLRE",
-    # Dynamic watchlist additions (auto-populated by dynamic_watchlist.py)
-    # These are added to SECTOR_MAP so sector RS works correctly for dynamic symbols.
-    # Without this entry, dynamic symbols fall back to SPY which defeats the sector filter.
-    # Technology
+
+    # Dynamic watchlist additions
     "CEVA":"XLK","ICHR":"XLK","IDCC":"XLK",
-    # Consumer Discretionary
     "CHEF":"XLY",
-    # Health Care
     "ATRC":"XLV","OCUL":"XLV","PRCT":"XLV","TNDM":"XLV","NEOG":"XLV",
-    # Industrials
     "FSTR":"XLI",
-    # Energy
     "FLNC":"XLE",
-    # Financials
     "FRST":"XLF",
 }
 
+# ───────────────────────────────────────────────────────────────
+# EXTENDED SECTOR MAP (covers all UNIVERSE tickers)
+# MUST BE DEFINED BEFORE update()
+# ───────────────────────────────────────────────────────────────
+_SECTOR_MAP_EXTRA = {
+    # Technology / Software
+    "DOMO":"XLK","EVER":"XLK","MTSI":"XLK","JAMF":"XLK",
+    "BLKB":"XLK","CARG":"XLK","CCOI":"XLK","CDRE":"XLK",
+    "CHGG":"XLK","CMCO":"XLK","COHU":"XLK","CRVL":"XLK",
+    "CVLT":"XLK","DIOD":"XLK","EGHT":"XLK","EGAN":"XLK",
+    "EPAC":"XLK","EXLS":"XLK","FORR":"XLK","FTDR":"XLK",
+    "GNSS":"XLK","HIMX":"XLK","HURC":"XLK","IESC":"XLK",
+    "IDCC":"XLK","ITRI":"XLK","KVHI":"XLK","LSCC":"XLK",
+    "LYTS":"XLK","MGNI":"XLK","MLAB":"XLK","MRCY":"XLK",
+    "NTGR":"XLK","NOVT":"XLK","NSP":"XLK","OMCL":"XLK",
+    "OPCH":"XLK","PRGS":"XLK","SMAR":"XLK","LFST":"XLK",
+    "CLFD":"XLK","ATNI":"XLK","LPSN":"XLK","DSGN":"XLK",
+
+    # Healthcare
+    "AMRX":"XLV","HCAT":"XLV","HROW":"XLV","HRMY":"XLV",
+    "IDYA":"XLV","IMCR":"XLV","INSM":"XLV","KRTX":"XLV",
+    "LGND":"XLV","LNTH":"XLV","MDGL":"XLV","MMSI":"XLV",
+    "MNKD":"XLV","MYGN":"XLV","NKTR":"XLV","NVAX":"XLV",
+    "PCRX":"XLV","RARE":"XLV","RCUS":"XLV","RXST":"XLV",
+    "SRPT":"XLV","TGTX":"XLV","PCVX":"XLV","CORT":"XLV",
+    "ARQT":"XLV","OCGN":"XLV","IONS":"XLV","ACLS":"XLV",
+
+    # Financials
+    "ABR":"XLF","AIV":"XLF","AMH":"XLF","BCPC":"XLF",
+    "BPOP":"XLF","CVBF":"XLF","CHCO":"XLF","CHDN":"XLF",
+    "CTBI":"XLF","EFC":"XLF","FBRT":"XLF","FISI":"XLF",
+    "FMBH":"XLF","FRME":"XLF","GDOT":"XLF","GSBC":"XLF",
+    "HAFC":"XLF","HBT":"XLF","HFWA":"XLF","HOPE":"XLF",
+    "HTLD":"XLF","HURN":"XLF","INDB":"XLF","IPAR":"XLF",
+    "KMPR":"XLF","LKFN":"XLF","LCII":"XLF","LPRO":"XLF",
+    "MBWM":"XLF","MFIN":"XLF","MORN":"XLF","MVBF":"XLF",
+    "NATH":"XLF","NBTB":"XLF","NFBK":"XLF","NMFC":"XLF",
+    "NMIH":"XLF","NWBI":"XLF","OBNK":"XLF","OCFC":"XLF",
+    "OCSL":"XLF","OFG":"XLF","OPRT":"XLF","BANR":"XLF",
+    "FFIN":"XLF","GBCI":"XLF","SFNC":"XLF","HOMB":"XLF",
+    "BCAL":"XLF","CBAN":"XLF","RNST":"XLF","NWFL":"XLF",
+
+    # Industrials
+    "CDRE":"XLI","CLAR":"XLI","CLW":"XLI","DAN":"XLI",
+    "EML":"XLI","EPAC":"XLI","ERII":"XLI","EXPO":"XLI",
+    "FELE":"XLI","FOXF":"XLI","GTLS":"XLI","HWKN":"XLI",
+    "HURC":"XLI","HCC":"XLI","IART":"XLI","IESC":"XLI",
+    "KELYA":"XLI","MATW":"XLI","MATX":"XLI","MBIN":"XLI",
+    "MYRG":"XLI","NNBR":"XLI","NOMD":"XLI","NSP":"XLI",
+    "TITN":"XLI","MRTN":"XLI","CMCO":"XLI",
+
+    # Energy
+    "FLNC":"XLE","GNW":"XLE","GLNG":"XLE","KNTK":"XLE",
+    "NESR":"XLE","HLX":"XLE",
+
+    # Materials
+    "CBT":"XLB","BCPC":"XLB","HWKN":"XLB",
+
+    # Consumer Discretionary
+    "DBRG":"XLY","DIN":"XLY","EXPI":"XLY","EZPW":"XLY",
+    "GRPN":"XLY","HAIN":"XLY","JACK":"XLY","JBSS":"XLY",
+    "KELYA":"XLY","LCUT":"XLY","LECO":"XLY","LOVE":"XLY",
+    "MCRI":"XLY","MNRO":"XLY","NDLS":"XLY","PRPL":"XLY",
+    "HVT":"XLY","CHEF":"XLY",
+
+    # Consumer Staples
+    "CVCO":"XLP","JJSF":"XLP",
+
+    # Utilities
+    "MSEX":"XLU","OGS":"XLU",
+
+    # Real Estate
+    "CLDT":"XLRE","DEA":"XLRE","ELME":"XLRE","ESRT":"XLRE",
+    "FBRT":"XLRE","GOOD":"XLRE","HASI":"XLRE","HIW":"XLRE",
+    "IIPR":"XLRE","NXRT":"XLRE","ABR":"XLRE","AIV":"XLRE",
+    "AMH":"XLRE","EFC":"XLRE",
+}
+
+# Apply extended mappings
+SECTOR_MAP.update(_SECTOR_MAP_EXTRA)
+
+# ───────────────────────────────────────────────────────────────
+# NASDAQ‑100 SECTOR MAP
+# ───────────────────────────────────────────────────────────────
+_NASDAQ_SECTORS = {
+    "AAPL":"XLK","MSFT":"XLK","NVDA":"XLK","AMD":"XLK","AVGO":"XLK",
+    "QCOM":"XLK","AMAT":"XLK","LRCX":"XLK","KLAC":"XLK","MU":"XLK",
+    "MRVL":"XLK","SNPS":"XLK","CDNS":"XLK","INTC":"XLK","ON":"XLK",
+    "NXPI":"XLK","TXN":"XLK","MCHP":"XLK","SMCI":"XLK","GFS":"XLK",
+    "PANW":"XLK","CRWD":"XLK","ZS":"XLK","FTNT":"XLK","TEAM":"XLK",
+    "DDOG":"XLK","ADBE":"XLK","ADSK":"XLK","ANSS":"XLK","WDAY":"XLK",
+    "FISV":"XLK","CTSH":"XLK","PAYX":"XLK",
+    "AMZN":"XLY","TSLA":"XLY","BKNG":"XLY","LULU":"XLY","ABNB":"XLY",
+    "MELI":"XLY","ORLY":"XLY","ROST":"XLY",
+    "NFLX":"XLC","META":"XLC","GOOG":"XLC","GOOGL":"XLC","WBD":"XLC",
+    "TTWO":"XLC","EA":"XLC","NTES":"XLC","JD":"XLC","BIDU":"XLC",
+    "RBLX":"XLC","ZM":"XLC","SIRI":"XLC","TTD":"XLC",
+    "COST":"XLP","KDP":"XLP","MNST":"XLP","WBA":"XLP",
+    "AMGN":"XLV","GILD":"XLV","VRTX":"XLV","BIIB":"XLV",
+    "REGN":"XLV","MRNA":"XLV","IDXX":"XLV","ILMN":"XLV",
+    "ODFL":"XLI","PCAR":"XLI","FAST":"XLI","CSX":"XLI","VRSK":"XLI",
+    "GEHC":"XLV","CSGP":"XLRE",
+    "AEP":"XLU","EXC":"XLU",
+    "COIN":"XLF","PYPL":"XLF",
+    "PDD":"XLY","ASML":"XLK","FANG":"XLE",
+}
+
+# Apply NASDAQ mappings
+SECTOR_MAP.update(_NASDAQ_SECTORS)
+
 UNIVERSE = list(dict.fromkeys([
-    "CRUS","POWI","MTSI","JAMF","ALKT","TASK","APPF","VCRA","DOMO","EVER",
+    "CRUS","POWI","MTSI","JAMF","ALKT","TASK","APPF","DOMO","EVER",
     "INVA","TNDM","HAYW","ASTE","KTOS","DLX","HLIO","TROX","RYAM","KWR",
-    "NTST","GMRE","EPRT","CIVI","PTEN","WTTR","BOOT","GIII","PLAY","LESL",
-    "PRPL","HIMS","ACAD","PDCO","HCAT","NVCR","GKOS","CURO","OPFI","GCMG",
-    "AXNX","PRCT","ARVN","ARWR","FOLD","IMVT","KRYS","LGND","MYGN","NKTR",
-    "NVAX","PCRX","RARE","RCUS","SRPT","TGTX","ABR","AIV","ALEX","AMH",
-    "STAG","CUBE","DEA","EFC","EQC","FBRT","GOOD","HIW","AMRX","ATRC",
+    "NTST","EPRT","CIVI","PTEN","WTTR","BOOT","GIII","PLAY","LESL",
+    "PRPL","HIMS","ACAD","PDCO","HCAT","NVCR","GKOS","OPFI","GCMG",
+    "PRCT","ARVN","ARWR","FOLD","IMVT","KRYS","LGND","MYGN","NKTR",
+    "NVAX","PCRX","RARE","RCUS","SRPT","TGTX","ABR","AIV","AMH",
+    "STAG","CUBE","DEA","EFC","FBRT","GOOD","HIW","AMRX","ATRC",
     "BCPC","BLKB","BPOP","CABO","CADE","CARG","CBT","CCOI","CDRE","CEVA",
-    "CHCO","CHDN","CHEF","CHGG","CIR","CLAR","CLDT","CLW","CMCO","CNMD",
-    "CNSL","COHU","CONN","COUP","CRVL","CTBI","CVBF","CVCO","CVLT","CWST",
+    "CHCO","CHDN","CHEF","CHGG","CLAR","CLDT","CLW","CMCO","CNMD",
+    "COHU","CRVL","CTBI","CVBF","CVCO","CVLT","CWST",
     "DAN","DBRG","DIN","DIOD","DXLG","EAT","ECPG","EGAN","EGHT","ELME",
     "EML","ENVA","EPAC","ERII","ESRT","ETSY","EVGO","EVTC","EXLS","EXPI",
-    "EXPO","EZPW","FARO","FBMS","FELE","FGEN","FISI","FLNC","FLR","FMBH",
-    "FORM","FORR","FOXF","FRME","FRST","FSTR","FTDR","GDEN","GDOT","GEOS",
+    "EXPO","EZPW","FELE","FISI","FLNC","FLR","FMBH",
+    "FORM","FORR","FOXF","FRME","FRST","FSTR","FTDR","GDOT","GEOS",
     "GIFI","GLDD","GLNG","GNSS","GNW","GPOR","GPRE","GRPN","GSBC","GSHD",
     "GTLS","HAFC","HAIN","HALO","HASI","HBT","HCC","HCSG","HELE",
-    "HFWA","HIBB","HIIQ","HIMX","HLX","HMST","HOPE","HROW","HRMY","HSII",
-    "HTBK","HTLD","HTLF","HURC","HURN","HVT","HWKN","IART","IBTX","ICFI",
+    "HFWA","HIMX","HLX","HOPE","HROW","HRMY","HSII",
+    "HTLD","HURC","HURN","HVT","HWKN","IART","ICFI",
     "ICHR","IDCC","IDYA","IESC","IIPR","IMCR","INDB","INMD","INSM","IONS",
     "IPAR","IRDM","IRTC","ITRI","JACK","JBSS","JJSF","KELYA","KMPR","KNTK",
-    "KVHI","LBAI","LCII","LCUT","LECO","LKFN","LMAT","LNTH","LOVE","LPRO",
-    "LQDT","LSCC","LSTR","LTHM","LYTS","MARA","MATW","MATX","MBIN","MBWM",
-    "MCRI","MDGL","MDRX","MERC","MFIN","MGNI","MGPI","MLAB","MMSI","MNKD",
-    "MNRO","MODV","MOFG","MORN","MRCY","MRTN","MRUS","MSEX","MTDR","MVBF",
-    "NATH","NBTB","NCBS","NDLS","NEOG","NESR","NEXT","NFBK","NLSN","NMFC",
-    "NMIH","NNBR","NOMD","NOVT","NSP","NTGR","NTRA","NWBI","NXRT","NYCB",
+    "KVHI","LCII","LCUT","LECO","LKFN","LMAT","LNTH","LOVE","LPRO",
+    "LQDT","LSCC","LSTR","LYTS","MARA","MATW","MATX","MBIN","MBWM",
+    "MCRI","MDGL","MERC","MFIN","MGNI","MGPI","MLAB","MMSI","MNKD",
+    "MNRO","MODV","MORN","MRCY","MRTN","MRUS","MSEX","MTDR","MVBF",
+    "NATH","NBTB","NDLS","NEOG","NESR","NEXT","NFBK","NMFC",
+    "NMIH","NNBR","NOMD","NOVT","NSP","NTGR","NTRA","NWBI","NXRT",
     "OBNK","OCFC","OCGN","OCSL","OCUL","OFG","OGS","OMCL","OPCH","OPRT",
+    # Banking/Financials (replaced HTBK, HTLF, IBTX, LBAI, NCBS, MOFG, NYCB)
+    "BANR","FFIN","GBCI","SFNC","HOMB","BCAL","CBAN","NWFL","RNST",
+    # Technology (replaced VCRA, COUP, MDRX, AXNX, CNSL)
+    "SMAR","PRGS","DSGN","LFST","CLFD","ATNI","LPSN",
+    # Healthcare (replaced FGEN, AXNX, HIIQ)
+    "RXST","TGTX","ACLS","ARQT","KRTX","PCVX","CORT",
+    # Industrials/Energy (replaced FARO, GDEN, ALEX, CIR, CONN, COUP)
+    "HLIO","ASTE","MYRG","TITN","DLX","KTOS","MTDR",
 ]))
 
 # ── Optional: tickers.txt universe override ──────────────────────────────────
@@ -343,7 +473,267 @@ if os.path.exists(_tickers_path):
 # WATCHLIST:   40-stock curated list   - fast, manual picks
 # RUSSELL2000: Full IWM constituent list ~2000 stocks - more signals, more noise
 # Set UNIVERSE_MODE to switch. Russell 2000 requires stricter firewalls.
-UNIVERSE_MODE      = "WATCHLIST"     # "WATCHLIST" | "RUSSELL2000"
+UNIVERSE_MODE      = "WATCHLIST"     # "WATCHLIST" | "QQQ" | "IWM" | "RUSSELL2000"
+
+# ── NASDAQ-100 / QQQ Universe ─────────────────────────────────────────────────
+# Large-cap NASDAQ tech stocks. Use with --universe QQQ or UNIVERSE_MODE="QQQ".
+# Benchmark: QQQ (not SPY). Higher cap floor: $5B. Trend-biased strategy.
+NASDAQ_100 = [
+    "AAPL","MSFT","NVDA","AMZN","GOOG","GOOGL","META","TSLA","AVGO","COST",
+    "NFLX","AMD","ADBE","QCOM","AMAT","LRCX","KLAC","MU","MRVL","SNPS",
+    "CDNS","PANW","CRWD","ZS","FTNT","WDAY","TEAM","DDOG","MELI","REGN",
+    "AMGN","GILD","VRTX","BIIB","MRNA","IDXX","ILMN","ROST","ODFL","PCAR",
+    "FAST","CSX","ORLY","VRSK","KDP","MNST","TTD","ANSS","PAYX","CTSH",
+    "FISV","ADSK","GEHC","CSGP","BKNG","LULU","ABNB","COIN","RBLX","EA",
+    "TTWO","INTC","ON","NXPI","MCHP","TXN","SMCI","AEP","EXC","WBD",
+    "FANG","PDD","JD","BIDU","ZM","SIRI","WBA","ASML","GFS","PYPL",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HIERARCHICAL RS ARCHITECTURE  (Seven-Layer Pipeline)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Layer 2 — Sector Mapping:   SECTOR_MAP  →  broad sector ETF (XLK, XLV …)
+# Layer 2b— Industry Mapping: INDUSTRY_ETF_MAP → sub-sector ETF (SOXX, XBI…)
+# Layer 4 — Benchmark:  always SPY (market) + sector ETF (sector alpha)
+#                        + industry ETF when available (micro-regime alpha)
+#
+# The old logic (`if mcap < 3B: IWM`) was wrong because:
+#   - small cap is a CHARACTERISTIC, not a benchmark
+#   - a small-cap bank should compare to KRE, not IWM
+#   - a small-cap biotech should compare to XBI, not IWM
+#   - IWM as benchmark conflates sector effects with size effects
+#
+# The new flow in scan_symbol():
+#   sector_etf   = SECTOR_MAP[symbol]          # broad economic group
+#   industry_etf = INDUSTRY_ETF_MAP[symbol]    # micro-regime (may be None)
+#   RS1 = sector_etf    vs SPY        → is the sector leading the market?
+#   RS2 = stock_return  vs sector_etf → is the stock leading its sector?
+#   RS3 = stock_return  vs industry_etf → is it leading its micro-regime?
+#   composite_sector_score = weighted blend of RS1, RS2, RS3
+#   gate passes only if: sector not collapsing AND stock not lagging sector
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Layer 2b: Industry / Sub-sector ETF Map ──────────────────────────────────
+# Maps individual tickers to their specific industry ETF benchmark.
+# More granular than the broad GICS sector ETFs.
+# Only populated for tickers where micro-regime matters significantly.
+# Unmapped tickers fall back to their SECTOR_MAP entry.
+INDUSTRY_ETF_MAP: dict = {
+    # ── Semiconductors → SOXX ────────────────────────────────────────────
+    # Semis are a tight micro-regime: all move together on inventory cycles,
+    # earnings, and AI capex. Comparing a semi to broad XLK vs SOXX is the
+    # difference between sector alpha and true peer alpha.
+    "CRUS":"SOXX","POWI":"SOXX","MTSI":"SOXX","ALKT":"SOXX",
+    "ICHR":"SOXX","COHU":"SOXX","DIOD":"SOXX","LSCC":"SOXX",
+    # NASDAQ-100 semis
+    "NVDA":"SOXX","AMD":"SOXX","AVGO":"SOXX","QCOM":"SOXX",
+    "MU":"SOXX","AMAT":"SOXX","LRCX":"SOXX","KLAC":"SOXX",
+    "MRVL":"SOXX","SNPS":"SOXX","CDNS":"SOXX","INTC":"SOXX",
+    "ON":"SOXX","NXPI":"SOXX","TXN":"SOXX","MCHP":"SOXX",
+
+    # ── Biotech / Biopharmaceutical → XBI ────────────────────────────────
+    # Biotech has near-zero correlation with broad healthcare (XLV) during
+    # sector rotations. A biotech in a collapsing XBI should not pass sector
+    # gate just because XLV (med devices, pharma) is holding up.
+    "ACAD":"XBI","NVCR":"XBI","IMVT":"XBI","KRYS":"XBI",
+    "FOLD":"XBI","INVA":"XBI","ARWR":"XBI","ARVN":"XBI",
+    "RCUS":"XBI","TGTX":"XBI","RXST":"XBI","SRPT":"XBI",
+    "IDYA":"XBI","IMCR":"XBI","INSM":"XBI","RARE":"XBI",
+    "IONS":"XBI","BIIB":"XBI","VRTX":"XBI","REGN":"XBI",
+    "MRNA":"XBI","NKTR":"XBI","OCGN":"XBI","MDGL":"XBI",
+    "LGND":"XBI","MYGN":"XBI","ARQT":"XBI","KRTX":"XBI",
+    "PCVX":"XBI","CORT":"XBI","MNKD":"XBI","HRMY":"XBI",
+
+    # ── Healthcare Equipment / MedTech → IHI ─────────────────────────────
+    "ATRC":"IHI","GKOS":"IHI","MMSI":"IHI","PRCT":"IHI",
+    "TNDM":"IHI","OMCL":"IHI","IART":"IHI","CNMD":"IHI",
+    "OCUL":"IHI","IRTC":"IHI","LMAT":"IHI","ATRC":"IHI",
+    "NEOG":"IHI","ITRI":"IHI",
+
+    # ── Regional Banks → KRE ─────────────────────────────────────────────
+    # Regional banks decouple from broad XLF (which includes megabanks,
+    # insurance, asset managers). KRE tracks the micro-regime correctly.
+    "OPFI":"KRE","ECPG":"KRE","ENVA":"KRE","GCMG":"KRE",
+    "OBNK":"KRE","BPOP":"KRE","CHCO":"KRE","CVBF":"KRE",
+    "FRME":"KRE","HAFC":"KRE","HBT":"KRE","HFWA":"KRE",
+    "HOPE":"KRE","INDB":"KRE","LKFN":"KRE","MBWM":"KRE",
+    "NBTB":"KRE","NFBK":"KRE","NWBI":"KRE","OCFC":"KRE",
+    "OFG":"KRE","FRST":"KRE","CTBI":"KRE","FMBH":"KRE",
+    "GBCI":"KRE","BANR":"KRE","FFIN":"KRE","SFNC":"KRE",
+    "HOMB":"KRE","BCAL":"KRE","CBAN":"KRE","RNST":"KRE",
+    "NRDS":"KRE",
+
+    # ── Oil & Gas E&P → XOP ──────────────────────────────────────────────
+    # Upstream O&G tracks oil/gas prices much more tightly than broad XLE
+    # (which includes majors, midstream, and services).
+    "PTEN":"XOP","WTTR":"XOP","MTDR":"XOP","GPOR":"XOP",
+    "REX":"XOP","GPRE":"XOP",
+
+    # ── Oil Services → OIH ───────────────────────────────────────────────
+    "NESR":"OIH","HLX":"OIH",
+
+    # ── Retail → XRT ─────────────────────────────────────────────────────
+    "BOOT":"XRT","GIII":"XRT","PLAY":"XRT","DXLG":"XRT",
+    "HAIN":"XRT","LESL":"XRT","LOVE":"XRT","NDLS":"XRT",
+    "JACK":"XRT","HVT":"XRT","JBSS":"XRT",
+
+    # ── Software → IGV ───────────────────────────────────────────────────
+    "TASK":"IGV","APPF":"IGV","BLKB":"IGV","CARG":"IGV",
+    "DOMO":"IGV","FORR":"IGV","EVER":"IGV","EXLS":"IGV",
+    "CHGG":"IGV","EGHT":"IGV","EGAN":"IGV","CVLT":"IGV",
+    "ANSS":"IGV","WDAY":"IGV","ADSK":"IGV",
+
+    # ── REITs → VNQ ──────────────────────────────────────────────────────
+    "NTST":"VNQ","EPRT":"VNQ","STAG":"VNQ","CUBE":"VNQ",
+    "HIW":"VNQ","NXRT":"VNQ","IIPR":"VNQ","ABR":"VNQ",
+    "AIV":"VNQ","AMH":"VNQ","FBRT":"VNQ","GOOD":"VNQ",
+    "CLDT":"VNQ","ESRT":"VNQ","ELME":"VNQ","DEA":"VNQ",
+
+    # ── Aerospace & Defense → ITA ────────────────────────────────────────
+    "KTOS":"ITA","MRCY":"ITA",
+
+    # ── Clean Energy → ICLN ──────────────────────────────────────────────
+    "FLNC":"ICLN","HASI":"ICLN",
+}
+
+# Expanded SECTOR_MAP — covers all UNIVERSE tickers
+# Ensures every symbol has a correct broad-sector ETF assignment.
+# Unmapped tickers fall back to "SPY" (neutral market comparison).
+# Add new tickers here before adding them to UNIVERSE or WATCHLIST.
+_SECTOR_MAP_EXTRA: dict = {
+    # Technology / Software
+    "DOMO":"XLK","EVER":"XLK","MTSI":"XLK","JAMF":"XLK",
+    "BLKB":"XLK","CARG":"XLK","CCOI":"XLK","CDRE":"XLK",
+    "CHGG":"XLK","CMCO":"XLK","COHU":"XLK","CRVL":"XLK",
+    "CVLT":"XLK","DIOD":"XLK","EGHT":"XLK","EGAN":"XLK",
+    "EPAC":"XLK","EXLS":"XLK","FORR":"XLK","FTDR":"XLK",
+    "GNSS":"XLK","HIMX":"XLK","HURC":"XLK","IESC":"XLK",
+    "IDCC":"XLK","ITRI":"XLK","KVHI":"XLK","LSCC":"XLK",
+    "LYTS":"XLK","MGNI":"XLK","MLAB":"XLK","MRCY":"XLK",
+    "NTGR":"XLK","NOVT":"XLK","NSP":"XLK","OMCL":"XLK",
+    "OPCH":"XLK","PRGS":"XLK","SMAR":"XLK","LFST":"XLK",
+    "CLFD":"XLK","ATNI":"XLK","LPSN":"XLK","DSGN":"XLK",
+    # Healthcare
+    "AMRX":"XLV","HCAT":"XLV","HROW":"XLV","HRMY":"XLV",
+    "IDYA":"XLV","IMCR":"XLV","INSM":"XLV","KRTX":"XLV",
+    "LGND":"XLV","LNTH":"XLV","MDGL":"XLV","MMSI":"XLV",
+    "MNKD":"XLV","MYGN":"XLV","NKTR":"XLV","NVAX":"XLV",
+    "PCRX":"XLV","RARE":"XLV","RCUS":"XLV","RXST":"XLV",
+    "SRPT":"XLV","TGTX":"XLV","PCVX":"XLV","CORT":"XLV",
+    "ARQT":"XLV","OCGN":"XLV","IONS":"XLV","ACLS":"XLV",
+    # Financials
+    "ABR":"XLF","AIV":"XLF","AMH":"XLF","BCPC":"XLF",
+    "BPOP":"XLF","CVBF":"XLF","CHCO":"XLF","CHDN":"XLF",
+    "CTBI":"XLF","EFC":"XLF","FBRT":"XLF","FISI":"XLF",
+    "FMBH":"XLF","FRME":"XLF","GDOT":"XLF","GSBC":"XLF",
+    "HAFC":"XLF","HBT":"XLF","HFWA":"XLF","HOPE":"XLF",
+    "HTLD":"XLF","HURN":"XLF","INDB":"XLF","IPAR":"XLF",
+    "KMPR":"XLF","LKFN":"XLF","LCII":"XLF","LPRO":"XLF",
+    "MBWM":"XLF","MFIN":"XLF","MORN":"XLF","MVBF":"XLF",
+    "NATH":"XLF","NBTB":"XLF","NFBK":"XLF","NMFC":"XLF",
+    "NMIH":"XLF","NWBI":"XLF","OBNK":"XLF","OCFC":"XLF",
+    "OCSL":"XLF","OFG":"XLF","OPRT":"XLF","BANR":"XLF",
+    "FFIN":"XLF","GBCI":"XLF","SFNC":"XLF","HOMB":"XLF",
+    "BCAL":"XLF","CBAN":"XLF","RNST":"XLF","NWFL":"XLF",
+    # Industrials
+    "CDRE":"XLI","CLAR":"XLI","CLW":"XLI","DAN":"XLI",
+    "EML":"XLI","EPAC":"XLI","ERII":"XLI","EXPO":"XLI",
+    "FELE":"XLI","FOXF":"XLI","GTLS":"XLI","HWKN":"XLI",
+    "HURC":"XLI","HCC":"XLI","IART":"XLI","IESC":"XLI",
+    "KELYA":"XLI","MATW":"XLI","MATX":"XLI","MBIN":"XLI",
+    "MYRG":"XLI","NNBR":"XLI","NOMD":"XLI","NSP":"XLI",
+    "TITN":"XLI","MRTN":"XLI","CMCO":"XLI",
+    # Energy
+    "FLNC":"XLE","GNW":"XLE","GLNG":"XLE","KNTK":"XLE",
+    "NESR":"XLE","HLX":"XLE",
+    # Materials
+    "CBT":"XLB","BCPC":"XLB","HWKN":"XLB",
+    # Consumer Discretionary
+    "DBRG":"XLY","DIN":"XLY","EXPI":"XLY","EZPW":"XLY",
+    "GRPN":"XLY","HAIN":"XLY","JACK":"XLY","JBSS":"XLY",
+    "KELYA":"XLY","LCUT":"XLY","LECO":"XLY","LOVE":"XLY",
+    "MCRI":"XLY","MNRO":"XLY","NDLS":"XLY","PRPL":"XLY",
+    "HVT":"XLY","CHEF":"XLY",
+    # Consumer Staples
+    "CVCO":"XLP","JJSF":"XLP",
+    # Utilities
+    "MSEX":"XLU","OGS":"XLU",
+    # Real Estate
+    "CLDT":"XLRE","DEA":"XLRE","ELME":"XLRE","ESRT":"XLRE",
+    "FBRT":"XLRE","GOOD":"XLRE","HASI":"XLRE","HIW":"XLRE",
+    "IIPR":"XLRE","NXRT":"XLRE","ABR":"XLRE","AIV":"XLRE",
+    "AMH":"XLRE","EFC":"XLRE",
+    # Communication Services
+    "CABO":"XLC","CHDN":"XLC","EVTC":"XLC","GSHD":"XLC",
+    "IRDM":"XLC","NTGR":"XLC",
+}
+
+
+def get_industry_etf(symbol: str) -> str | None:
+    """
+    Returns the most specific benchmark ETF for RS comparison.
+
+    Layer 2b in the seven-layer pipeline:
+      Industry ETF > Sector ETF > SPY
+
+    Examples:
+      NVDA  → SOXX  (semiconductor micro-regime, not generic XLK)
+      ACAD  → XBI   (biotech regime, not generic XLV)
+      OPFI  → KRE   (regional bank regime, not generic XLF)
+      KTOS  → ITA   (defense micro-regime, not generic XLI)
+      BOOT  → XRT   (retail micro-regime, not generic XLY)
+      BOOT  → XLY   (fallback if XRT not available)
+      ALKT  → SOXX  (despite being "software" the stock trades with semis)
+
+    Returns None if no industry mapping exists (use sector ETF instead).
+    """
+    return INDUSTRY_ETF_MAP.get(symbol)
+
+
+# ── Layer 4: Dynamic Benchmark Assignment ────────────────────────────────────
+def get_benchmarks(symbol: str) -> dict:
+    """
+    Three-tier benchmark hierarchy (Seven-Layer Pipeline Layer 4).
+    Benchmarks assigned by SECTOR + INDUSTRY, never market cap or index.
+
+    primary   = SPY   (market alpha baseline -- always)
+    secondary = sector ETF (XLK, XLV, XLE... from SECTOR_MAP)
+    tertiary  = industry ETF (SOXX, XBI, KRE... from INDUSTRY_ETF_MAP)
+
+    Example: NVDA  ->  SPY / XLK / SOXX
+      NVDA +2%, SPY +1% looks good.
+      NVDA +2%, SOXX +4% means NVDA is lagging its semi peers -> penalty.
+    """
+    return {
+        "primary":   "SPY",
+        "secondary": SECTOR_MAP.get(symbol, "SPY"),
+        "tertiary":  INDUSTRY_ETF_MAP.get(symbol),
+    }
+
+
+# ── RS Benchmark ETF prefetch list ──────────────────────────────────────────
+# All ETFs needed for RS computations -- pre-cached by --prefetch task.
+RS_BENCHMARK_ETFS = list(dict.fromkeys([
+    "SPY", "QQQ", "IWM",
+    "XLK","XLF","XLV","XLY","XLP","XLE","XLI","XLB","XLRE","XLU","XLC",
+    "SOXX","XBI","KRE","XOP","OIH","XRT","IGV","VNQ","ITA","IHI","ICLN","CIBR","XAR",
+]))
+
+
+# ── Layer 1: Russell 2000 / IWM Universe -- eligibility only ─────────────────
+# IWM membership = stock is ELIGIBLE to be scanned.
+# NOT the benchmark.  A Russell 2000 biotech compares vs XBI + XLV, not IWM.
+RUSSELL_2000_ELIGIBLE   = True
+RUSSELL_2000_SUPPLEMENT = [
+    "LYTS","NTGR","KVHI","LSCC","FORM","COHU","GNSS","EGAN","HIMX",
+    "MNKD","TGTX","CORT","HRMY","HROW","PCVX","KRTX","ACLS","RXST",
+    "GEOS","NESR","KNTK","HLX","GIFI",
+    "NFBK","MVBF","MFIN","MERC","HBT","GSBC","FRST","FMBH","CTBI","CHCO",
+    "LOVE","NDLS","NOMD","NATH","JJSF","JACK","HVT",
+    "MYRG","TITN","NNBR","HURC","IESC","FSTR","EPAC",
+]
+
 
 # ── Thresholds ───────────────────────────────────────────────
 # NOTE: MIDCAP_MIN/MAX are fallback defaults only.
@@ -353,8 +743,8 @@ MIDCAP_MIN         = 300_000_000      # $300M baseline
 MIDCAP_MAX         = 20_000_000_000   # $20B baseline (MR and AUTO default)
 ACCOUNT_SIZE       = float(os.environ.get("ACCOUNT_SIZE", 50000))
 SIGNAL_THRESHOLD   = 65
-ATR_STOP_MULT      = 1.5
-ATR_TARGET_MULT    = 3.0
+ATR_STOP_MULT      = 1.5   # risk  = ATR × 1.5
+ATR_TARGET_MULT    = 4.5   # reward = ATR × 4.5 → 3:1 R:R  (4.5 / 1.5 = 3.0)
 SPY_WEAK_THRESH    = -0.005
 
 # ── Dynamic Cap Limits by Strategy ───────────────────────────
@@ -556,12 +946,32 @@ MARKOV_GATE_ENABLED   = False
 STRATEGY_MODE      = "AUTO"
 
 # ── Mean Reversion Exit ───────────────────────────────────────
-MR_TAKE_PROFIT_PCT = 0.005   # flat % TP (only used as floor; MR actually targets VWAP)
+MR_TAKE_PROFIT_PCT = 0.005   # flat % TP (floor only; MR actually targets VWAP)
 MR_STOP_LOSS_PCT   = 0.008   # floor stop -- actual stop uses ATR*1.5 when available
-# R:R NOTE: flat TP=0.5% / SL=0.8% is inverted (need 73% win rate after slippage).
-# The scanner uses VWAP as MR target which is dynamically larger -- check your
-# rr_ratio column in scan_log. Trades with rr_ratio < 1.0 should be filtered.
-MR_MIN_RR_RATIO    = 1.0     # block MR entries where R:R < 1.0 (would need >50% WR)
+# R:R NOTE: flat TP=0.5% / SL=0.8% inverted (needs 73% WR after slippage).
+# VWAP target is dynamically larger. Check rr_ratio in scan_log for real R:R.
+MR_MIN_RR_RATIO    = 1.0     # block MR entries where R:R < 1.0
+
+# Gap filter for MR: don't enter MR on stocks with large gap-up
+# GAP-UP = 0% WR confirmed in hypothesis -- gap-up stocks are trending, not reverting
+# Threshold: gap > 2% = stock is in momentum mode, MR invalidated
+MR_GAP_UP_MAX      = 0.02    # block MR when gap-up exceeds 2% (trending, not reverting)
+MR_GAP_DOWN_MAX    = -0.10   # also block extreme gap-down > 10% (potential halt/news)
+
+# Gate 13: Momentum ROC filter (falling knife guard)
+# If price dropped >MR_ROC_THRESHOLD in last MR_ROC_LOOKBACK bars, block MR entry.
+# Prevents buying into vertical flushes where the "mean" is actively moving away.
+# 1.5% drop in 3 bars = stock moving at ~18%/hour -- too fast for MR entry.
+MR_ROC_LOOKBACK    = 3       # bars to measure momentum over (3 × 5min = 15min)
+MR_ROC_THRESHOLD   = -0.015  # raw fallback threshold (used when vol estimate unavailable)
+MR_ROC_NORM_THRESH = -1.5    # normalized threshold: block when 3-bar drop > 1.5× typical move
+                              # biotech ATR=4%: blocks at -6% drop. utility ATR=0.5%: blocks at -0.75%
+MR_ROC_ENABLED     = True    # set False to disable during testing
+
+# Extreme RVOL ceiling for MR (Gate 12)
+# RVOL > 8x usually means news/fundamental repricing -- NOT mean reversion.
+# These symbols route to TREND or get excluded from MR entirely.
+MR_RVOL_MAX        = 8.0     # above this, MR disabled (likely trend/news event)
 
 # ── ADX Regime ───────────────────────────────────────────────
 ADX_MAX            = 25
@@ -585,7 +995,9 @@ PARKINSON_SHOCK_COOLDOWN_M = 15    # minutes to keep MR blocked after shock clea
 
 # Runtime shock state (set by terminal scan loop, read by scan_symbol)
 # When True: scan_symbol() returns None for all MR signals (circuit breaker)
-_SHOCK_MR_OVERRIDE = False   # set externally by scanner_terminal_v4.py
+_SHOCK_MR_OVERRIDE = False
+_IWM_CACHE      = None   # cached IWM 5m bars (refreshed every 2 min)
+_IWM_CACHE_TIME = 0.0    # timestamp of last IWM fetch   # set externally by scanner_terminal_v4.py
 
 
 # ── Parkinson Volatility (High-Low based, scale-invariant) ──────────────────
@@ -743,17 +1155,15 @@ def is_trading_allowed() -> tuple:
       - Past EOD hard exit time
     """
     if GLOBAL_KILL_SWITCH:
-        return False, "GLOBAL_KILL_SWITCH=True - all entries halted"
-
+        return False, "GLOBAL_KILL_SWITCH=True - all entries halted", 0.0
     now = datetime.now()
     # Before market open
     if now.hour < 9 or (now.hour == 9 and now.minute < 30):
-        return False, "PRE_MARKET - no entries before 9:30 AM"
+        return False, "PRE_MARKET - no entries before 9:30 AM", 0.0
     # Hard EOD exit
     if now.hour > EOD_HARD_EXIT_HOUR or \
        (now.hour == EOD_HARD_EXIT_HOUR and now.minute >= EOD_HARD_EXIT_MIN):
-        return False, f"EOD_HARD_EXIT - past {EOD_HARD_EXIT_HOUR}:{EOD_HARD_EXIT_MIN:02d} PM"
-
+        return False, f"EOD_HARD_EXIT - past {EOD_HARD_EXIT_HOUR}:{EOD_HARD_EXIT_MIN:02d} PM", 0.0
     return True, "OK"
 
 
@@ -783,16 +1193,14 @@ def portfolio_allows_entry(symbol: str, sector_etf: str,
 
     # Rule 1: Max open positions
     if len(open_pos) >= MAX_OPEN_POSITIONS:
-        return False, f"MAX_POSITIONS: {len(open_pos)}/{MAX_OPEN_POSITIONS} open"
-
+        return False, f"MAX_POSITIONS: {len(open_pos)}/{MAX_OPEN_POSITIONS} open", 0.0
     # Rule 2: Max per sector
     sector_count = sum(
         1 for sym, p in open_pos.items()
         if SECTOR_MAP.get(sym, "SPY") == sector_etf
     )
     if sector_count >= MAX_SECTOR_POSITIONS:
-        return False, f"MAX_SECTOR: {sector_count}/{MAX_SECTOR_POSITIONS} in {sector_etf}"
-
+        return False, f"MAX_SECTOR: {sector_count}/{MAX_SECTOR_POSITIONS} in {sector_etf}", 0.0
     # Rule 3: Max total account risk
     total_risk = sum(
         abs(p.entry_price - p.stop) * p.shares
@@ -801,8 +1209,7 @@ def portfolio_allows_entry(symbol: str, sector_etf: str,
     )
     risk_pct = total_risk / account_size if account_size > 0 else 0.0
     if risk_pct >= MAX_TOTAL_RISK_PCT:
-        return False, f"MAX_RISK: {risk_pct:.1%} of account at risk (max {MAX_TOTAL_RISK_PCT:.0%})"
-
+        return False, f"MAX_RISK: {risk_pct:.1%} of account at risk (max {MAX_TOTAL_RISK_PCT:.0%})", 0.0
     return True, f"OK - {len(open_pos)} open, {sector_count} in {sector_etf}, {risk_pct:.1%} at risk"
 
 
@@ -841,22 +1248,18 @@ def validate_before_execute(result: dict, current_price: float,
     min_hl = (HALFLIFE_MIN_REMAINING_SCALP if UNIVERSE_MODE == "RUSSELL2000"
               else HALFLIFE_MIN_REMAINING_INTRADAY)
     if not hl_alive or hl_rem < min_hl:
-        return False, f"SIGNAL_EXPIRED: {hl_rem:.0f}s remaining (min {min_hl}s)"
-
+        return False, f"SIGNAL_EXPIRED: {hl_rem:.0f}s remaining (min {min_hl}s)", 0.0
     # 3. Price drift - reject if moved more than 0.5% from signal
     if signal_px > 0:
         drift = abs(current_price - signal_px) / signal_px
         if drift > 0.005:
-            return False, f"PRICE_DRIFT: {drift:.2%} from signal price ${signal_px:.2f}"
-
+            return False, f"PRICE_DRIFT: {drift:.2%} from signal price ${signal_px:.2f}", 0.0
     # 4. Range Filter still confirming
     if not rf_confirms:
-        return False, "RF_NO_CONFIRM: Range Filter no longer confirming direction"
-
+        return False, "RF_NO_CONFIRM: Range Filter no longer confirming direction", 0.0
     # 5. GLOBAL_REGIME_LOCK check
     if GLOBAL_REGIME_LOCK and GLOBAL_REGIME_LOCK != strategy:
-        return False, f"REGIME_LOCK: system locked to {GLOBAL_REGIME_LOCK}, signal is {strategy}"
-
+        return False, f"REGIME_LOCK: system locked to {GLOBAL_REGIME_LOCK}, signal is {strategy}", 0.0
     # 6. Portfolio limits
     port_ok, port_reason = portfolio_allows_entry(sym, sector_etf, positions, ACCOUNT_SIZE)
     if not port_ok:
@@ -1099,8 +1502,8 @@ def compute_zscore(prices: np.ndarray, window: int = 20) -> float:
     return float((prices[-1] - np.mean(prices[-window:])) / s) if s else 0.0
 
 def zscore_gate(z: float, direction: str) -> tuple:
-    if direction == "LONG"  and z >  ZSCORE_MAX: return False, f"Z={z:.2f} EXHAUSTED"
-    if direction == "SHORT" and z <  ZSCORE_MIN: return False, f"Z={z:.2f} EXHAUSTED"
+    if direction == "LONG"  and z >  ZSCORE_MAX: return False, f"Z={z:.2f} EXHAUSTED", 0.0
+    if direction == "SHORT" and z <  ZSCORE_MIN: return False, f"Z={z:.2f} EXHAUSTED", 0.0
     return True, f"Z={z:.2f} "
 
 def zscore_score(z: float) -> float:
@@ -1257,26 +1660,99 @@ def combined_hurst_score(h_daily: float, h_intraday: float) -> tuple:
 
 
 def compute_ofi(df: pd.DataFrame, window: int = 12) -> tuple:
-    h, l, c, v = df["high"].values, df["low"].values, df["close"].values, df["volume"].values
-    br   = np.where(h - l > 0, (c - l) / (h - l), 0.5)
-    ofi  = (pd.Series(br * v).rolling(window, min_periods=3).sum() /
-            pd.Series(v).rolling(window, min_periods=3).sum().replace(0, np.nan)).fillna(0.5)
-    cur  = float(ofi.iloc[-1])
-    delt = float(ofi.iloc[-1] - ofi.iloc[-4]) if len(ofi) >= 4 else 0.0
-    return round(cur, 4), round(delt, 4), round(float(np.clip(cur*100 + delt*50, 0, 100)), 1)
+    """
+    Signed Order Flow Imbalance (OFI) -- CVD-based, range [-1.0, +1.0].
+
+    Formula:  signed_ofi = (buy_vol - sell_vol) / (buy_vol + sell_vol)
+    Buy/sell split estimated via bar price position (tick-rule proxy):
+      br  = (close - low) / (high - low)   ->  fraction of bar volume that was buying
+      buy_vol  = br  × total_volume
+      sell_vol = (1-br) × total_volume
+
+    Scale:
+      +1.0  = all bars closed at high (pure buy pressure)
+      -1.0  = all bars closed at low  (pure sell pressure)
+       0.0  = balanced / neutral
+      ±0.50 = 3:1 imbalance  (3× buy vs sell, or vice-versa)
+
+    Score (0-100): maps [-1,+1] → [0,100] with delta acceleration bonus.
+    References: QuantVPS OFI guide; Cont, Kukanov & Stoikov (2014).
+    """
+    h, l, c, v   = (df["high"].values, df["low"].values,
+                    df["close"].values, df["volume"].values)
+    br           = np.where(h - l > 0, (c - l) / (h - l), 0.5)
+    buy_vol      = br * v
+    sell_vol     = (1.0 - br) * v
+    net          = pd.Series(buy_vol - sell_vol)
+    tot          = pd.Series(buy_vol + sell_vol).replace(0, np.nan)
+    ofi          = (net.rolling(window, min_periods=3).sum() /
+                    tot.rolling(window, min_periods=3).sum()).fillna(0.0)
+    cur          = float(np.clip(ofi.iloc[-1], -1.0, 1.0))
+    delt         = float(ofi.iloc[-1] - ofi.iloc[-4]) if len(ofi) >= 4 else 0.0
+    # Map signed [-1,+1] → score [0,100]: neutral(0)=50, full-buy(1)=100, full-sell(-1)=0
+    score        = float(np.clip((cur + 1.0) * 50.0 + delt * 25.0, 0.0, 100.0))
+    return round(cur, 4), round(delt, 4), round(score, 1)
 
 def ofi_signal(ofi: float, delta: float) -> str:
-    # Thresholds aligned with OFI_LONG_ENTRY=0.30 adaptive base
-    # Upper band: 0.30 + 0.20 buffer = 0.50 (accumulating territory)
-    # Lower band: 0.50 - 0.20 buffer = 0.30 (selling territory)
-    if ofi >= 0.55 and delta >= 0: return "ACCUMULATING"
-    if ofi >= 0.52 and delta <  0: return "TOPPING"
-    if ofi <= 0.35:                return "DISTRIBUTING"
-    if ofi <= 0.44:                return "SELLING"
+    # Thresholds on signed OFI scale [-1, +1].  0 = neutral.
+    # ±0.50 = 3:1 buy/sell imbalance (standard OFI trigger per QuantVPS).
+    # Negative values now properly flag sell-side pressure.
+    if ofi >= 0.50 and delta >= 0:  return "ACCUMULATING"   # ≥3:1 buy, strengthening
+    if ofi >= 0.30 and delta <  0:  return "TOPPING"         # buy pressure fading
+    if ofi <= -0.50:                 return "DISTRIBUTING"   # ≥3:1 sell pressure
+    if ofi <= -0.20:                 return "SELLING"         # growing sell pressure
     return "NEUTRAL"
 
 
-def compute_atr(df: pd.DataFrame, n: int = 14) -> float:
+def compute_ofi_normalized(df: pd.DataFrame,
+                            window: int = 12,
+                            norm_window: int = 60) -> float:
+    """
+    Z-score normalized OFI per Dean Markwick (2022) / Cont et al. (2014).
+
+    Method:
+      1. Compute signed OFI per bar: (buy_vol - sell_vol) / total_vol  ∈ [-1,+1]
+      2. Aggregate over rolling `window` bars
+      3. Normalize via rolling Z-score over `norm_window` bars:
+             ofi_norm = (ofi - rolling_mean(ofi)) / rolling_std(ofi)
+
+    Why: Raw OFI is very spiky and scale-dependent across symbols.
+    Normalization compresses it to a stable, comparable range (~-3 to +3).
+    The paper finds ofi_norm provides a ~3% R² out-of-sample predictive edge.
+
+    Thresholds (empirically validated on 5m equity bars):
+      ofi_norm > +1.5  →  strong buy pressure (top ~7% of all bars)
+      ofi_norm < -1.5  →  strong sell pressure
+      |ofi_norm| < 0.5 →  neutral / noise
+
+    Args:
+        df:          OHLCV DataFrame (must have high, low, close, volume)
+        window:      bars to aggregate OFI over (default 12 = ~1h on 5m bars)
+        norm_window: rolling lookback for Z-score (default 60 = ~5h on 5m bars)
+
+    Returns:
+        float clipped to [-5.0, +5.0]
+    """
+    if df is None or len(df) < max(window, 5):
+        return 0.0
+    h, l, c, v  = (df["high"].values, df["low"].values,
+                   df["close"].values, df["volume"].values)
+    br           = np.where(h - l > 0, (c - l) / (h - l), 0.5)
+    buy_vol      = br * v
+    sell_vol     = (1.0 - br) * v
+    net          = pd.Series(buy_vol - sell_vol)
+    tot          = pd.Series(buy_vol + sell_vol).replace(0, np.nan)
+    ofi_raw      = (net.rolling(window, min_periods=3).sum() /
+                    tot.rolling(window, min_periods=3).sum()).fillna(0.0)
+    # Rolling Z-score (Markwick: "scale the OFI values to a known range")
+    _min_n       = max(5, norm_window // 4)
+    ofi_mean     = ofi_raw.rolling(norm_window, min_periods=_min_n).mean()
+    ofi_std      = ofi_raw.rolling(norm_window, min_periods=_min_n).std()
+    ofi_norm     = ((ofi_raw - ofi_mean) /
+                    ofi_std.replace(0, np.nan)).fillna(0.0)
+    return round(float(np.clip(ofi_norm.iloc[-1], -5.0, 5.0)), 3)
+
+
     if df is None or len(df) < n: return 0.0
     h, l, c = df["high"].values, df["low"].values, df["close"].values
     trs = [max(h[-i] - l[-i],
@@ -1403,29 +1879,113 @@ def get_market_regime() -> dict:
             "park_vol":   round(_park_v, 6)}  # raw current Parkinson vol
 
 
-def get_sector_rs(etf: str) -> tuple:
+def get_sector_rs(etf: str, benchmark: str = "SPY") -> tuple:
     """
+    Layer 1 of hierarchical RS: how is the SECTOR performing vs its benchmark?
+    Answers: "Is the sector leading or lagging the market?"
+
     Returns (ratio, score, gate_passes).
-    score is non-linear -- rewards sector leadership more aggressively:
-      RS = 1.00  -> score 50  (neutral, sector matching SPY)
-      RS = 1.02  -> score 65  (slight leadership)
-      RS = 1.05  -> score 80  (clear sector leader)
-      RS = 1.10  -> score 100 (exceptional leadership)
-    This separates "just barely passes" from "sector is clearly leading"
-    within the scoring system, even though both pass the gate.
     """
-    ec, sc = fetch_closes_cached(etf, 25), fetch_closes_cached("SPY", 25)
-    if ec is None or sc is None or len(ec) < 20 or len(sc) < 20:
+    ec  = fetch_closes_cached(etf, 25)
+    bc  = fetch_closes_cached(benchmark, 25)
+    if ec is None or bc is None or len(ec) < 20 or len(bc) < 20:
         return 1.0, 50.0, True
-    ratio  = (ec[-1] / np.mean(ec[-20:])) / (sc[-1] / np.mean(sc[-20:]))
+    ratio  = (ec[-1] / np.mean(ec[-20:])) / (bc[-1] / np.mean(bc[-20:]))
     dyn_rs = get_dynamic_sector_rs(STRATEGY_MODE)
-    # Non-linear score: steep ramp above 1.02 (clear leadership)
-    # flat below 1.00 (lagging sector stays penalised at low score)
     score  = float(np.clip(50 + (ratio - 1.0) * 600, 0, 100))
     return round(ratio, 4), round(score, 1), ratio >= dyn_rs
 
 
-def kelly_size(price: float, atr: float, win_rate: float = 0.60, rr: float = 2.0) -> tuple:
+def get_stock_vs_etf_rs(symbol: str, etf: str, n: int = 20) -> tuple:
+    """
+    Layer 2 of hierarchical RS: how is the STOCK performing vs its sector/industry ETF?
+    Answers: "Is this stock leading or lagging its peers?"
+
+    This is the critical alpha signal:
+      stock_rs > 1.0  →  stock outperforming sector  (sector alpha)
+      stock_rs < 1.0  →  stock underperforming sector (avoid)
+      stock_rs < 0.97 →  hard block (stock is sick within a healthy sector)
+
+    Returns (ratio, score, outperforming: bool).
+    """
+    sc = fetch_closes_cached(symbol, n + 5)
+    ec = fetch_closes_cached(etf, n + 5)
+    if sc is None or ec is None or len(sc) < n or len(ec) < n:
+        return 1.0, 50.0, True   # insufficient data → neutral (don't block)
+    stock_ret  = sc[-1] / np.mean(sc[-n:])
+    etf_ret    = ec[-1] / np.mean(ec[-n:])
+    ratio      = stock_ret / etf_ret if etf_ret > 0 else 1.0
+    score      = float(np.clip(50 + (ratio - 1.0) * 500, 0, 100))
+    return round(ratio, 4), round(score, 1), ratio >= 0.98
+
+
+def get_hierarchical_rs(symbol: str, sector_etf: str,
+                        industry_etf: str | None = None,
+                        n: int = 20) -> dict:
+    """
+    Seven-Layer Pipeline — Layers 2, 2b, 4, 5.
+    Computes RS at three levels simultaneously:
+
+      Level 1 — Market alpha:    sector_etf  vs SPY
+                                 "Is the sector beating the market?"
+      Level 2 — Sector alpha:    stock       vs sector_etf
+                                 "Is the stock beating its sector?"
+      Level 3 — Industry alpha:  stock       vs industry_etf
+                                 "Is the stock beating its micro-regime?"
+                                 (Only when industry_etf is available)
+
+    A stock is truly strong only when ALL levels are positive:
+      sector beats SPY  AND  stock beats sector  AND  stock beats industry
+
+    This prevents two failure modes:
+      A) "Laggard in a hot sector": sector soaring but stock underperforming peers
+         → RS vs SPY looks OK but RS vs sector catches it
+      B) "Winner in a dying sector": stock leading sector but sector collapsing vs SPY
+         → RS vs sector looks OK but RS vs SPY catches it
+
+    Returns dict with all RS levels, composite score, and gate status.
+    """
+    # Level 1: sector vs market
+    rs1, sc1, gate1 = get_sector_rs(sector_etf, "SPY")
+
+    # Level 2: stock vs sector
+    rs2, sc2, gate2 = get_stock_vs_etf_rs(symbol, sector_etf, n)
+
+    # Level 3: stock vs industry ETF (if available and different from sector)
+    if industry_etf and industry_etf != sector_etf:
+        rs3, sc3, gate3 = get_stock_vs_etf_rs(symbol, industry_etf, n)
+    else:
+        rs3, sc3, gate3 = rs2, sc2, gate2   # fall back to sector RS
+
+    # ── Composite sector score ──────────────────────────────────────────
+    # Weights: sector leadership (35%) + stock-vs-sector (40%) + micro-regime (25%)
+    # The "stock vs sector" layer gets the most weight because it directly
+    # measures whether this stock is the right one to trade in this sector.
+    composite = round(0.35 * sc1 + 0.40 * sc2 + 0.25 * sc3, 1)
+
+    # ── Gate logic (pass/fail) ──────────────────────────────────────────
+    # Hard block: sector collapsing vs market (RS1 < 0.95)
+    # Hard block: stock sick within sector (RS2 < 0.97)
+    # Soft gate: use dynamic threshold from strategy mode
+    dyn_min = get_dynamic_sector_rs(STRATEGY_MODE)
+    hard_block = rs1 < 0.95 or rs2 < 0.97
+    soft_gate  = rs1 >= dyn_min and rs2 >= 0.98
+
+    return {
+        "rs_vs_spy":       rs1,          # sector vs market
+        "rs_vs_sector":    rs2,          # stock vs sector ETF
+        "rs_vs_industry":  rs3,          # stock vs industry ETF
+        "rs_spy_score":    sc1,
+        "rs_sector_score": sc2,
+        "rs_industry_score": sc3,
+        "sector_score":    composite,    # replaces old sec_sc
+        "sector_gate":     soft_gate and not hard_block,
+        "hard_block":      hard_block,
+        "industry_etf":    industry_etf or sector_etf,
+    }
+
+
+def kelly_size(price: float, atr: float, win_rate: float = 0.60, rr: float = 3.0) -> tuple:
     if atr <= 0 or price <= 0: return 0.0, 0.0, 0
     kf     = float(np.clip((win_rate - (1 - win_rate) / rr) * 0.5, 0.0, 0.10))
     drisk  = ACCOUNT_SIZE * kf
@@ -1569,7 +2129,8 @@ def compute_vwap_bands(df: pd.DataFrame, atr: float,
 # Must pass BOTH checks before any math runs. Kills zombie stocks immediately.
 
 def passes_liquidity_firewall(df_d: pd.DataFrame, symbol: str,
-                               strategy: str = "AUTO") -> tuple:
+                               strategy: str = "AUTO",
+                               spread_max_override: float = None) -> tuple:
     """
     Three-part firewall: dollar volume + RVOL + ATR%.
 
@@ -1587,7 +2148,7 @@ def passes_liquidity_firewall(df_d: pd.DataFrame, symbol: str,
       MR:    RVOL >= 1.2x, ATR >= 1.5% (quieter reversions, but range must exist)
     """
     if df_d is None or len(df_d) < 20:
-        return False, "INSUFFICIENT DATA"
+        return False, "INSUFFICIENT DATA", 0.0
 
     avg_price  = float(df_d["close"].tail(10).mean())
     avg_vol    = float(df_d["volume"].tail(20).mean())
@@ -1596,14 +2157,13 @@ def passes_liquidity_firewall(df_d: pd.DataFrame, symbol: str,
 
     # Gate 1: Minimum dollar volume (liquidity floor -- can you exit?)
     if dollar_vol < MIN_DOLLAR_VOLUME:
-        return False, f"LOW_DOLLAR_VOL ${dollar_vol/1e6:.1f}M < $5M"
+        return False, f"LOW_DOLLAR_VOL ${dollar_vol/1e6:.1f}M < $5M", 0.0
 
     # Gate 2: Relative volume (participation -- is anyone trading this today?)
     min_atr_pct, min_rvol = get_dynamic_vol_filters(strategy)
     rel_vol = curr_vol / avg_vol if avg_vol > 0 else 0.0
     if rel_vol < min_rvol:
-        return False, f"LOW_RELVOL {rel_vol:.2f}x < {min_rvol}x ({strategy})"
-
+        return False, f"LOW_RELVOL {rel_vol:.2f}x < {min_rvol}x ({strategy})", 0.0
     # Gate 3: ATR% (movement potential -- will it move enough to pay?)
     # FIX: highs[1:]-closes[:-1] produces n-1 elements but highs-lows produces n.
     # Fetch n+1 rows so [1:] slices align to exactly n elements.
@@ -1629,9 +2189,23 @@ def passes_liquidity_firewall(df_d: pd.DataFrame, symbol: str,
     # Estimated spread from High-Low range on recent bars. On small-caps,
     # a wide spread destroys MR edge: 0.5% TP is worthless if spread is 0.3%.
     # Threshold: spread > 0.3% blocks MR entries (TREND is more tolerant).
-    SPREAD_MAX_MR   = 0.003   # 0.3% -- MR needs tight spread to profit on 0.5% TP
-    SPREAD_MAX_TREND= 0.008   # 0.8% -- TREND can tolerate wider spread
-    spread_thresh   = SPREAD_MAX_MR if strategy == "MEAN_REVERSION" else SPREAD_MAX_TREND
+    # Spread gate -- two-tier: WARN vs BLOCK
+    # Rule: spread > 25% of TP = trade math is borderline
+    #       spread > 75% of TP = trade math is destroyed, block entirely
+    # With TP=0.5%: warn at 0.125%, hard block at 0.375%
+    # SPREAD_MAX_MR is the hard block level
+    # Use per-ticker spread max when adaptive params are available
+    # ALKT (ATR=4%): adaptive spread_max=3% vs global 0.375% -- huge difference
+    # spread_max_override is passed from scan_symbol AFTER loading adaptive params
+    if spread_max_override is not None:
+        SPREAD_MAX_MR  = spread_max_override
+        SPREAD_WARN_MR = spread_max_override * (0.25 / 0.75)
+    else:
+        SPREAD_MAX_MR  = MR_TAKE_PROFIT_PCT * 0.75
+        SPREAD_WARN_MR = MR_TAKE_PROFIT_PCT * 0.25
+    SPREAD_MAX_TREND = 0.008                         # 0.8% for TREND (larger targets)
+    spread_thresh    = SPREAD_MAX_MR if strategy == "MEAN_REVERSION" else SPREAD_MAX_TREND
+    spread_warn      = SPREAD_WARN_MR if strategy == "MEAN_REVERSION" else SPREAD_MAX_TREND
     try:
         _highs  = df_d["high"].tail(5).values.astype(float)
         _lows   = df_d["low"].tail(5).values.astype(float)
@@ -1641,11 +2215,48 @@ def passes_liquidity_firewall(df_d: pd.DataFrame, symbol: str,
     except Exception:
         est_spread = 0.0
 
-    if est_spread > spread_thresh and strategy == "MEAN_REVERSION":
-        return False, (f"WIDE_SPREAD {est_spread*100:.2f}% > {spread_thresh*100:.1f}% "
-                       f"(MR requires tight spread)")
+    # IWM index-level sensor: when Russell 2000 is volatile,
+    # spread requirements tighten automatically (Gate 4 multiplier)
+    # "If the tide (IWM) goes out fast, all boats drop" -- protect against index drag
+    # IWM cache: fetch at most once per 2 minutes across all symbol scans
+    global _IWM_CACHE, _IWM_CACHE_TIME
+    try:
+        import time as _time_mod
+        _now_t = _time_mod.time()
+        if '_IWM_CACHE' not in globals() or _now_t - globals().get('_IWM_CACHE_TIME', 0) > 120:
+            _IWM_CACHE = yf.Ticker("IWM").history(period="2d", interval="5m")
+            _IWM_CACHE_TIME = _now_t
+        _iwm = _IWM_CACHE
+        if _iwm is not None and len(_iwm) >= 15:
+            _iwm_park = get_parkinson_vol(
+                _iwm.rename(columns=str.lower).tail(20),
+                window=10, baseline_window=50
+            )
+            _iwm_ratio = _iwm_park[2]  # current/baseline ratio
+            if _iwm_ratio >= 2.0:
+                spread_thresh = spread_thresh * 0.3   # severe IWM shock -- very tight
+                _iwm_gate_note = f"IWM_SEVERE(ratio={_iwm_ratio:.1f}x)"
+            elif _iwm_ratio >= 1.5:
+                spread_thresh = spread_thresh * 0.5   # IWM elevated -- tighten
+                _iwm_gate_note = f"IWM_ELEVATED(ratio={_iwm_ratio:.1f}x)"
+            else:
+                _iwm_gate_note = ""
+        else:
+            _iwm_gate_note = ""
+    except Exception:
+        _iwm_gate_note = ""
 
-    return True, f"OK DV=${dollar_vol/1e6:.1f}M RV={rel_vol:.2f}x ATR={atr_pct*100:.1f}% SPR={est_spread*100:.2f}%"
+    if strategy == "MEAN_REVERSION" and est_spread > spread_thresh:
+        return False, (f"WIDE_SPREAD {est_spread*100:.3f}% > {spread_thresh*100:.3f}% "
+                       f"[>{MR_TAKE_PROFIT_PCT*100*0.75:.0f}% of TP — math destroyed]"
+                       + (f" {_iwm_gate_note}" if _iwm_gate_note else ""))
+
+    spread_flag = ""
+    if strategy == "MEAN_REVERSION" and est_spread > spread_warn:
+        spread_flag = f" [SPREAD WARN: {est_spread/MR_TAKE_PROFIT_PCT*100:.0f}% of TP]"
+
+    return True, (f"OK DV=${dollar_vol/1e6:.1f}M RV={rel_vol:.2f}x "
+                  f"ATR={atr_pct*100:.1f}% SPR={est_spread*100:.3f}%{spread_flag}"), est_spread
 
 
 # ── ADX Calculation ───────────────────────────────────────────────────────────
@@ -1960,9 +2571,19 @@ def close_position(symbol: str, exit_price: float, reason: str):
 
 
 # ── Master Scan ───────────────────────────────────────────────────────────────
-
 def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
-                mode: str = "auto") -> Optional[dict]:
+                mode: str = "auto", df_override=None) -> Optional[dict]:
+    """
+    Master scan for a single symbol.
+    Supports df_override for batched terminal scans (10x faster).
+    """
+
+    # --- FAST PATH vs SLOW PATH ---
+    # df_override = pre-batched intraday bars from run_universe_scan() chunked download.
+    # When provided, skip the per-ticker fetch_intraday() call (~0.3s saved per symbol).
+    # When None (standalone call), use normal fetch_intraday() below.
+    _df_i_override = df_override  # saved for use at the fetch_intraday() call site below
+
     """
     Dual-strategy scanner with hard strategy switch.
 
@@ -1991,11 +2612,34 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
     if df_d is None or len(df_d) < 30: return None
 
     # ── FIREWALL 3: Liquidity (runs before any expensive math) ─
-    liq_ok, liq_reason = passes_liquidity_firewall(df_d, symbol, STRATEGY_MODE)
+    # Load adaptive params BEFORE firewall so per-ticker spread gate applies
+    # Without this, ALKT (ATR=4%) gets blocked by global 0.375% spread threshold
+    # before its profile spread_max=3% is even checked
+    _pre_adaptive = {}
+    _pre_spread_override = None
+    if _TI_AVAILABLE:
+        try:
+            _pre_tp = _ti.TickerProfile(symbol)
+            _pre_adaptive = _pre_tp.get_adaptive_params(
+                global_tp=MR_TAKE_PROFIT_PCT,
+                global_sl=MR_STOP_LOSS_PCT,
+                global_score=SIGNAL_THRESHOLD,
+            )
+            if _pre_adaptive.get("source") == "ADAPTIVE":
+                _pre_spread_override = _pre_adaptive.get("spread_max")
+        except Exception:
+            pass
+
+    liq_ok, liq_reason, _liq_spread = passes_liquidity_firewall(
+        df_d, symbol, STRATEGY_MODE, spread_max_override=_pre_spread_override)
     if not liq_ok: return None
 
-    _df_i = fetch_intraday(symbol, timeframe)
-    df_i  = _df_i if (_df_i is not None and not _df_i.empty) else df_d.copy()
+    # ── Intraday data: use pre-batched override (fast path) or fetch individually ──
+    if _df_i_override is not None and len(_df_i_override) >= 15:
+        df_i = _df_i_override   # fast path: no per-ticker HTTP call
+    else:
+        _df_i = fetch_intraday(symbol, timeframe)
+        df_i  = _df_i if (_df_i is not None and not _df_i.empty) else df_d.copy()
     if len(df_i) < 15: df_i = df_d.copy()
 
     price       = float(df_d["close"].iloc[-1])
@@ -2021,24 +2665,134 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         return None
 
     # Parkinson shock circuit breaker: block ALL new MR entries during/after shock.
-    # _SHOCK_MR_OVERRIDE is set True by scanner_terminal_v4.py when park_shock fires.
-    # Cleared automatically after PARKINSON_SHOCK_COOLDOWN_M minutes.
-    # This prevents "oversold but still crashing" MR traps during volatility spikes.
     if strategy == "MEAN_REVERSION" and _SHOCK_MR_OVERRIDE:
         return None  # MR circuit breaker active -- skip this symbol
 
-    # ── FIREWALL 5: Sector RS ──────────────────────────────────
-    # Two-tier sector filter:
-    #   Hard block: RS < 0.95 -- sector is actively collapsing, no setup
-    #   Soft block: RS < dynamic threshold (1.00 TREND, 1.02 MR) -- sec_gate=False
-    #               but stock still scanned, sector_score penalises composite
-    # This means a TREND stock in a neutral sector (RS=1.00) isn't killed,
-    # but an MR stock where the sector can't pull it back (RS<1.02) loses score.
-    etf                      = SECTOR_MAP.get(symbol, "SPY")
-    sec_rs, sec_sc, sec_gate = get_sector_rs(etf)
-    # Hard block: sector is actively collapsing (RS < 0.95 = consistently lagging SPY)
-    if sec_rs < 0.95:
-        return None  # Sector is dragging badly -- no MR or trend setup possible
+    # ── Adaptive per-ticker parameters ──────────────────────────────────────
+    # Per-ticker TP/SL/score/momentum tuned from historical outcomes.
+    # Falls back to global constants when < 5 trades exist for this symbol.
+    # Reuse _pre_adaptive loaded before firewall (already has profile data)
+    # Avoids double disk read of SYMBOL.json per scan
+    _adaptive     = _pre_adaptive if _pre_adaptive else {}
+    _eff_tp          = _adaptive.get("tp",    MR_TAKE_PROFIT_PCT)
+    _eff_sl          = _adaptive.get("sl",    MR_STOP_LOSS_PCT)
+    _eff_score_floor = _adaptive.get("score_thresh", SIGNAL_THRESHOLD)
+    _eff_mom_thresh  = _adaptive.get("momentum_norm_thresh", MR_ROC_NORM_THRESH)
+    _eff_spread_max  = _adaptive.get("spread_max", MR_TAKE_PROFIT_PCT * 0.75)
+    _adaptive_src    = _adaptive.get("source", "GLOBAL")
+
+    # ── Gate 12: Extreme RVOL ceiling for MR ─────────────────────────────────
+    # RVOL > 8x = news/fundamental repricing, NOT temporary imbalance.
+    # High-RVOL events in MR = falling knife or moon shot. Route to TREND or skip.
+    if strategy == "MEAN_REVERSION":
+        try:
+            _rel_vol_check = float(df_i["volume"].iloc[-1] /
+                                   (df_i["volume"].rolling(20).mean().iloc[-1] + 1e-9))
+            if _rel_vol_check > MR_RVOL_MAX:
+                _rejected.append({"symbol": symbol, "reason": "EXTREME_RVOL",
+                                  "detail": f"RVOL={_rel_vol_check:.1f}x > {MR_RVOL_MAX}x "
+                                             f"(news/repricing event, not MR)"})
+                return None
+        except Exception:
+            pass
+
+    # ── Gate 12b: Gap Direction Filter for MR ────────────────────────────────
+    # Hypothesis shows: GAP-UP = 0% WR, GAP-DOWN = 100% WR on trend days.
+    # Stocks gapping up > 2% are in momentum/trending state -- don't MR them.
+    # The move is NOT a temporary imbalance; it's directional price discovery.
+    if strategy == "MEAN_REVERSION":
+        try:
+            # Compute gap inline -- intraday_health hasn't run yet at this point
+            _prior_c = float(df_d["close"].iloc[-2]) if len(df_d) >= 2 else price
+            _open_p  = float(df_i["open"].iloc[0])   if len(df_i) >= 1 else price
+            _gap = (_open_p - _prior_c) / (_prior_c + 1e-9) if _prior_c > 0 else 0.0
+            if _gap > MR_GAP_UP_MAX:
+                _rejected.append({"symbol": symbol, "reason": "GAP_UP_BLOCK",
+                                   "detail": f"gap_ret={_gap*100:.1f}% > "
+                                              f"{MR_GAP_UP_MAX*100:.0f}% "
+                                              f"(momentum gap, not MR candidate)"})
+                return None
+            if _gap < MR_GAP_DOWN_MAX:
+                _rejected.append({"symbol": symbol, "reason": "GAP_DOWN_EXTREME",
+                                   "detail": f"gap_ret={_gap*100:.1f}% < "
+                                              f"{MR_GAP_DOWN_MAX*100:.0f}% "
+                                              f"(extreme gap-down, possible halt/news)"})
+                return None
+        except Exception:
+            pass
+
+    # ── Gate 13: Volatility-Normalized Momentum Filter ───────────────────────
+    # Replaces fixed ROC threshold with ATR-normalized ROC (z-score of the move).
+    # Problem with fixed -1.5%: biotech moving 1.5% in 15min = normal (ATR 4%+).
+    #                            utility moving 1.5% in 15min = extreme (ATR 0.5%).
+    # Fix: normalize ROC by recent realized volatility so the threshold is
+    # "how many standard deviations of normal movement occurred?"
+    # Block when: normalized_roc < -MR_ROC_ZSCORE_THRESH (default -1.5 std devs)
+    # This means: "this drop is 1.5x more than the stock normally moves in 3 bars"
+    if strategy == "MEAN_REVERSION" and MR_ROC_ENABLED:
+        try:
+            _closes = df_i["close"].values.astype(float)
+            if len(_closes) >= MR_ROC_LOOKBACK + 5:
+                # Raw 3-bar ROC
+                _roc = (_closes[-1] - _closes[-(MR_ROC_LOOKBACK + 1)]) /                        (_closes[-(MR_ROC_LOOKBACK + 1)] + 1e-9)
+
+                # Realized volatility: std of 1-bar returns over last 20 bars
+                # This is the stock's natural per-bar movement -- our baseline
+                _rets = np.diff(_closes[-21:]) / (_closes[-21:-1] + 1e-9)
+                _realized_vol = float(np.std(_rets)) if len(_rets) >= 3 else 0.0
+
+                if _realized_vol > 1e-6:
+                    # Normalized ROC = how many bar-std-devs did price move in N bars?
+                    # sqrt(lookback) scales the per-bar vol to the N-bar window
+                    _expected_move = _realized_vol * np.sqrt(MR_ROC_LOOKBACK)
+                    _norm_roc = _roc / (_expected_move + 1e-9)
+
+                    # Block if move is more negative than MR_ROC_NORM_THRESH std devs
+                    # Default -1.5: blocks when 3-bar drop > 1.5× typical 3-bar move
+                    # Use per-ticker threshold: high-ATR stock needs bigger drop to qualify
+                    _eff_mom_local = _eff_mom_thresh if _adaptive else MR_ROC_NORM_THRESH
+                    if _norm_roc < _eff_mom_local:
+                        _rejected.append({"symbol": symbol, "reason": "MOMENTUM_FLUSH",
+                                          "detail": f"normROC={_norm_roc:.2f}σ < "
+                                                     f"{MR_ROC_NORM_THRESH}σ  "
+                                                     f"raw={_roc*100:.2f}%  "
+                                                     f"realVol={_realized_vol*100:.2f}%/bar"
+                                                     f" (flush vs stock's own baseline)"})
+                        return None
+                else:
+                    # Fallback to raw threshold when vol estimate unavailable
+                    if _roc < MR_ROC_THRESHOLD:
+                        _rejected.append({"symbol": symbol, "reason": "MOMENTUM_FLUSH",
+                                          "detail": f"ROC3={_roc*100:.2f}% < "
+                                                     f"{MR_ROC_THRESHOLD*100:.1f}% "
+                                                     f"(vertical flush)"})
+                        return None
+        except Exception:
+            pass
+
+    # ── FIREWALL 5: Hierarchical Sector RS (Seven-Layer Pipeline) ────────
+    # Three levels of RS computed simultaneously:
+    #   L1  sector_etf  vs SPY       → is the sector leading the market?
+    #   L2  stock       vs sector    → is this stock leading its sector peers?
+    #   L3  stock       vs industry  → is this stock leading its micro-regime?
+    #
+    # A signal requires: NOT (sector collapsing OR stock sick within sector).
+    # Hard block thresholds: sector < 0.95 vs SPY, OR stock < 0.97 vs sector.
+    etf          = SECTOR_MAP.get(symbol, "SPY")
+    industry_etf = get_industry_etf(symbol)   # SOXX for semis, XBI for biotech, etc.
+    _hrs         = get_hierarchical_rs(symbol, etf, industry_etf)
+
+    # Hard block: sector collapsing OR stock sick within its sector
+    if _hrs["hard_block"]:
+        _rejected.append({"symbol": symbol, "reason": "SECTOR_HARD_BLOCK",
+                          "detail": (f"rs_vs_spy={_hrs['rs_vs_spy']:.3f} "
+                                     f"rs_vs_sector={_hrs['rs_vs_sector']:.3f} "
+                                     f"sector={etf} industry={industry_etf or etf}")})
+        return None
+
+    sec_rs   = _hrs["rs_vs_spy"]          # backward compat (used in result dict)
+    sec_sc   = _hrs["sector_score"]       # composite of all 3 RS levels
+    sec_gate = _hrs["sector_gate"]        # passes dynamic threshold
 
     # ── Dynamic VWAP bands (after strategy and sector confirmed) ──
     # Only compute after NO_TRADE and sector hard-block checks pass
@@ -2048,27 +2802,48 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
     vwap        = vwap_bands["vwap"]  # refresh from bands
 
     # ── Core calculations (shared by both strategies) ─────────
+    # Regime probability defaults -- overwritten after Hurst is computed
+    _regime_mr_prob = 0.5
+    _regime_tr_prob = 0.5
+    _H_blend        = 0.5
+
     H_daily              = compute_hurst(closes)
     H_intra, _, h_intra_regime = compute_hurst_intraday(df_i)
     lam, hawk_sc         = compute_hawkes(df_i)
     ofi, od, o_sc        = compute_ofi(df_i)
+    # Markwick-style rolling Z-score normalized OFI (scale-invariant signal)
+    # ofi_norm > +1.5 = strong buy pressure, < -1.5 = strong sell pressure
+    ofi_norm             = compute_ofi_normalized(df_i)
     atr                  = compute_atr(df_d)
     add_val, add_b       = get_add_breadth()
     z                    = compute_zscore(closes)
     kurt, skew           = compute_kurtosis_skew(closes)
     hlth, hlbl, hd       = intraday_health(df_i, prior_close)
 
+    # ── Regime probability (SHARED -- used by BOTH strategy branches) ────────
+    # Must be computed before strategy split so REGIME_MISMATCH gate works
+    # for MR signals. Previously only ran in TREND branch -- MR always got
+    # 0.5/0.5 defaults, making the gate permanently inactive.
+    # Formula: sigmoid(k × (H − 0.5)) -- smooth 0→1 transition at H=0.50
+    #   H=0.58 → P(TREND)=0.73  H=0.42 → P(MR)=0.73  H=0.50 → 50/50
+    _k              = 10.0
+    _H_blend        = 0.40 * H_daily + 0.60 * H_intra if H_intra > 0 else H_daily
+    _H_blend        = float(np.clip(_H_blend, 0.01, 0.99))
+    _p_trend        = float(1.0 / (1.0 + np.exp(-_k * (_H_blend - 0.50))))
+    _p_mr           = 1.0 - _p_trend
+    _regime_mr_prob = round(_p_mr,    3)
+    _regime_tr_prob = round(_p_trend, 3)
+
     # ── STRATEGY BRANCH - exactly one fires ───────────────────
 
     if strategy == "TREND":
         # TREND MODE: Hurst + Hawkes + momentum OFI
-        # Mean reversion signals (Z-score entry, exhaustion) are NOT used here
         if mode == "intraday":
             h_sc, hurst_conflict = combined_hurst_score(H_daily, H_intra)
         else:
             h_sc, hurst_conflict = hurst_score(H_daily), False
 
-        direction_g = "LONG" if ofi >= 0.5 else "SHORT"
+        direction_g = "LONG" if ofi >= 0.0 else "SHORT"  # signed OFI: 0=neutral, >0=net buy
         ks_sc, ks_lbl = kurtosis_skew_score(kurt, skew, direction_g)
         z_ok, _       = zscore_gate(z, direction_g)
         bayes_p, b_log = bayesian_win_prob(add_b, sec_gate, hawk_sc, z_ok, ks_sc)
@@ -2119,14 +2894,27 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
                             (hurst_conflict or hawk_sc < 20 or hlth == 0.0))
         intraday_block_reason = ("HURST_CONFLICT" if hurst_conflict else "") +                                 (" HAWKES_SELL" if hawk_sc < 20 else "") +                                 (" HEALTH_ZERO" if hlth == 0.0 else "")
 
-        alert = (comp >= SIGNAL_THRESHOLD and market["allows_long"]
+        # TREND also uses per-ticker score threshold (same as MR)
+        _score_thr_trend = _eff_score_floor if _adaptive_src == "ADAPTIVE" else SIGNAL_THRESHOLD
+        alert = (comp >= _score_thr_trend and market["allows_long"]
                  and z_ok and not intraday_blocked
                  and (hlth > 0.0 if mode == "intraday" else True))
+
+        # TREND regime consistency gate
+        # H_blend < 0.5 means market is reverting -- TREND signal is fighting the tape
+        if alert and _regime_mr_prob > _regime_tr_prob:
+            alert = False
+            _rejected.append({"symbol": symbol, "reason": "TREND_REGIME_MISMATCH",
+                               "detail": f"P(TREND)={_regime_tr_prob:.2f} < "
+                                         f"P(MR)={_regime_mr_prob:.2f} "
+                                         f"[H_blend={_H_blend:.3f} -- reverting market]"})
 
         # Trend mode exit: ATR-based target
         stop_p  = round(price - atr * ATR_STOP_MULT,  2) if atr > 0 else 0.0
         target  = round(price + atr * ATR_TARGET_MULT, 2) if atr > 0 else 0.0
-        rr      = (target - price) / atr if atr > 0 else 0.0
+        # R:R = reward / risk  (correct formula: profit_dist / stop_dist)
+        _risk_dist = (price - stop_p) if stop_p > 0 and price > stop_p else atr * ATR_STOP_MULT
+        rr      = round((target - price) / _risk_dist, 2) if _risk_dist > 0 else 0.0
         exit_type = "ATR_TARGET"
         mr_long_sig = mr_short_sig = False
         vol_diverge = False
@@ -2136,7 +2924,7 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         # MEAN_REVERSION MODE: Exhaustion triple-gate + VWAP exit
         # Trend signals (Hurst momentum, Hawkes clustering) NOT used for entry
         h_sc, hurst_conflict = hurst_score(H_daily), False
-        direction_g   = "LONG" if ofi >= 0.5 else "SHORT"
+        direction_g   = "LONG" if ofi >= 0.0 else "SHORT"  # signed OFI: 0=neutral, >0=net buy
         ks_sc, ks_lbl = kurtosis_skew_score(kurt, skew, direction_g)
         z_ok = True  # Z-score is the ENTRY signal in MR mode, not a gate
         bayes_p, b_log = bayesian_win_prob(add_b, sec_gate, hawk_sc, True, ks_sc)
@@ -2193,26 +2981,44 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         mr_direction = "LONG" if mr_long_sig else "SHORT"
         direction_ok  = (market["allows_long"] if mr_direction == "LONG"
                          else True)  # shorts valid even in RISK-OFF
-        alert = (comp >= SIGNAL_THRESHOLD and not intraday_blocked
+        # Use per-ticker score threshold if adaptive (e.g. ALKT needs 72+, NOMD 65)
+        _score_thr_mr = _eff_score_floor if _adaptive_src == "ADAPTIVE" else SIGNAL_THRESHOLD
+        alert = (comp >= _score_thr_mr and not intraday_blocked
                  and hlth > 0.0 and direction_ok)
 
-        # MR exit: VWAP touch or 0.5% scalp - NOT ATR target
-        # Stop = larger of ATR-based (adapts to stock volatility) or 0.8% floor
-        atr_stop = round(price - atr * ATR_STOP_MULT, 2) if atr > 0 else 0.0
-        pct_stop = round(price * (1 - MR_STOP_LOSS_PCT), 2)
-        stop_p   = max(atr_stop, pct_stop)  # whichever is closer to price
-        target  = vwap                                          # VWAP is the exit
-        rr      = abs(vwap - price) / (price * MR_STOP_LOSS_PCT + 1e-9)
+        # MR exit: VWAP touch (primary) or adaptive TP% (floor)
+        # Stop = larger of ATR-based or per-ticker SL floor
+        # Uses adaptive params: ALKT (ATR=4%) gets wider stop than NOMD (ATR=0.5%)
+        atr_stop  = round(price - atr * ATR_STOP_MULT, 2) if atr > 0 else 0.0
+        pct_stop  = round(price * (1 - _eff_sl), 2)   # per-ticker or global SL
+        stop_p    = max(atr_stop, pct_stop)             # whichever is closer
+        target    = vwap                                # VWAP is primary target
+        # Adaptive TP floor: if VWAP too close, use per-ticker TP% instead
+        vwap_dist = abs(vwap - price) / (price + 1e-9)
+        if vwap_dist < _eff_tp:
+            # VWAP is inside our minimum target -- use TP% floor as target
+            target = round(price * (1 + _eff_tp), 2) if direction == "LONG" else                      round(price * (1 - _eff_tp), 2)
+        rr        = abs(target - price) / (abs(price - stop_p) + 1e-9)
 
-        # R:R gate: block MR entries where VWAP is too close to price
-        # If VWAP ≈ price, reward is tiny relative to stop risk.
-        # MR_MIN_RR_RATIO=1.0 means reward must at least equal risk.
+        # REGIME_MISMATCH first -- if market is trending, MR is wrong strategy
+        # No point checking R:R math when regime is fundamentally wrong
+        if alert and _regime_tr_prob > _regime_mr_prob:
+            alert = False
+            _rejected.append({"symbol": symbol, "reason": "REGIME_MISMATCH",
+                               "detail": f"P(MR)={_regime_mr_prob:.2f} < "
+                                          f"P(TREND)={_regime_tr_prob:.2f} "
+                                          f"[H_blend={_H_blend:.3f} > 0.50]"})
+
+        # R:R gate: only runs when regime is correct
         if alert and rr < MR_MIN_RR_RATIO:
-            alert = False  # suppress signal -- poor R:R, not worth the trade
+            alert = False
+            _rejected.append({"symbol": symbol, "reason": "POOR_RR",
+                               "detail": f"rr={rr:.2f} < {MR_MIN_RR_RATIO} "
+                                         f"[target too close to entry]"})
         exit_type = "VWAP_TOUCH"
 
     # ── Shared post-processing ────────────────────────────────
-    direction_g  = "LONG" if (mr_long_sig if strategy == "MEAN_REVERSION" else ofi >= 0.5) else "SHORT"
+    direction_g  = "LONG" if (mr_long_sig if strategy == "MEAN_REVERSION" else ofi >= 0.0) else "SHORT"  # signed OFI
     strength, hl_rem, hl_alive = halflife_remaining(symbol, comp, price, atr)
     kf, drisk, shares = kelly_size(price, atr, win_rate=bayes_p) if alert else (0.0, 0.0, 0)
 
@@ -2312,15 +3118,22 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         # Indicators
         "hawkes_lam":lam,"hawkes_score":hawk_sc,"hawkes_sig":hawkes_signal(hawk_sc),
         "ofi":ofi,"ofi_delta":od,"ofi_score":o_sc,"ofi_sig":ofi_signal(ofi,od),
+        "ofi_norm":ofi_norm,  # rolling Z-score normalized OFI (Markwick 2022)
         "signed_ofi": round(float(signed_ofi) if 'signed_ofi' in locals() else 0.0, 4),
         "market":market["regime"],"regime":market["regime"],"sector_etf":etf,
         "sector_rs":sec_rs,"sector_score":sec_sc,"sector_gate":sec_gate,
+        # ── Hierarchical RS (Seven-Layer Pipeline) ────────────────────────
+        "rs_vs_spy":     _hrs["rs_vs_spy"],       # sector vs SPY (market alpha)
+        "rs_vs_sector":  _hrs["rs_vs_sector"],    # stock vs sector ETF (sector alpha)
+        "rs_vs_industry":_hrs["rs_vs_industry"],  # stock vs industry ETF (micro-regime)
+        "industry_etf":  _hrs["industry_etf"],    # SOXX/XBI/KRE/etc or sector_etf
+        "index_benchmark": "SPY",                 # market baseline always SPY
         "add_val":add_val,"add_bull":add_b,"add_score":round(add_score(add_b),1),
         "zscore":round(z,3),"zscore_score":round(zscore_score(z),1),"zscore_ok":z_ok,
         "kurtosis":kurt,"skewness":skew,"ks_score":ks_sc,"ks_label":ks_lbl,
         "bayes_prob":round(bayes_p*100,1),"bayes_factors":b_log,
         "hl_strength":strength,"hl_remaining":round(hl_rem,0),"hl_alive":hl_alive,
-        "rr_ratio":round(rr,2),"rr_ok":rr >= 2.0,
+        "rr_ratio":round(rr,2),"rr_ok":rr >= 3.0,
         "kelly_frac":kf,"dollar_risk":drisk,"shares":shares,
         "atr":atr,"stop":stop_p,"target":target,"vwap":round(vwap,2),
         # Mean reversion specific
@@ -2332,6 +3145,9 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         "below_vwap":hd.get("below_vwap",False),
         "mcap_b":mcap_b,"scanned_at":datetime.now().strftime("%H:%M:%S"),
         "park_shock":market.get("park_shock",False),"park_ratio":round(market.get("park_ratio",1.0),3),
+        "regime_mr_prob":_regime_mr_prob,"regime_tr_prob":_regime_tr_prob,"H_blend":round(_H_blend,3),
+        "atr_pct":round(atr/price if price>0 else 0.02, 5),"est_spread":round(_liq_spread if "_liq_spread" in dir() else 0.0, 5),
+        "adaptive_src":_adaptive_src,"adaptive_tp":_eff_tp,"adaptive_sl":_eff_sl,
         # ── Dynamic VWAP bands ────────────────────────────────
         "vwap_upper1":   vwap_bands.get("upper1", vwap),
         "vwap_lower1":   vwap_bands.get("lower1", vwap),
@@ -2361,6 +3177,7 @@ def scan_symbol(symbol: str, market: dict, timeframe: str = "5m",
         ),
         # ── Universe mode tag ─────────────────────────────────
         "universe_mode": UNIVERSE_MODE,
+        "signal_threshold": _score_thr_mr,
     }
 
     # ── Ticker Intelligence: apply profile score adjustment ──────────────
@@ -2445,7 +3262,7 @@ def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
             if df_d is None or len(df_d) < 30:
                 return sym, None, "NO_DATA", "Insufficient daily bars"
 
-            liq_ok, liq_msg = passes_liquidity_firewall(df_d, sym, STRATEGY_MODE)
+            liq_ok, liq_msg, _ = passes_liquidity_firewall(df_d, sym, STRATEGY_MODE)
             if not liq_ok:
                 return sym, None, "LIQUIDITY", liq_msg
 
@@ -2527,108 +3344,123 @@ def run_full_scan(symbols: list = WATCHLIST, timeframe: str = "5m") -> tuple:
 
 
 # ── Universe Scanner ──────────────────────────────────────────────────────────
-
-def universe_prefilter(symbols: list) -> list:
-    """Original sequential prefilter - kept as fallback."""
-    survivors = []
-    for sym in symbols:
-        try:
-            df = yf.Ticker(sym).history(period="1mo", interval="1d")
-            if df.empty or len(df) < 10: continue
-            df.columns = [c.lower() for c in df.columns]
-            p = float(df["close"].iloc[-1])
-            if p < 5: continue
-            if float(df["volume"].mean()) < 300_000: continue
-            if float(df["close"].diff().abs().mean() / p) < 0.02: continue
-            ok, _ = is_midcap(sym, STRATEGY_MODE)
-            if ok: survivors.append(sym)
-        except Exception:
-            continue
-    print(f"[UNIVERSE] {len(symbols)} -> {len(survivors)} survivors")
-    return survivors
-
-
-def universe_prefilter_fast(symbols: list) -> list:
-    """
-    Fast prefilter using yf.download() batch call.
-    Downloads all symbols in a single HTTP request instead of one per symbol.
-    ~10x faster than universe_prefilter() for large lists.
-    Falls back to sequential if batch download fails.
-    """
-    try:
-        # Single batch download - yfinance fetches all symbols in one call
-        raw = yf.download(
-            symbols, period="1mo", interval="1d",
-            group_by="ticker", auto_adjust=True,
-            progress=False, threads=True
-        )
-        survivors = []
-        for sym in symbols:
-            try:
-                # Handle both single and multi-symbol DataFrame formats
-                if len(symbols) == 1:
-                    df = raw
-                else:
-                    df = raw[sym] if sym in raw.columns.get_level_values(0) else None
-                if df is None or df.empty or len(df) < 10: continue
-                df.columns = [c.lower() for c in df.columns]
-                if "close" not in df.columns: continue
-                p = float(df["close"].iloc[-1])
-                if p < 5: continue
-                if float(df["volume"].mean()) < 300_000: continue
-                if float(df["close"].diff().abs().mean() / p) < 0.02: continue
-                ok, _ = is_midcap(sym, STRATEGY_MODE)
-                if ok: survivors.append(sym)
-            except Exception:
-                continue
-        print(f"[UNIVERSE FAST] {len(symbols)} -> {len(survivors)} survivors")
-        return survivors
-    except Exception as e:
-        print(f"[UNIVERSE FAST] Batch failed ({e}), falling back to sequential")
-        return universe_prefilter(symbols)
-
-
 def run_universe_scan(top_n: int = 30, timeframe: str = "5m") -> pd.DataFrame:
     """
-    Two-stage universe scan - both stages parallelized.
-    Stage 1 (prefilter): parallel HTTP batch using yf.download().
-    Stage 2 (full scan):  parallel via ThreadPoolExecutor.
-    Removes the 0.3s sleep (was needed for sequential rate limiting,
-    not needed when batching requests).
+    Optimized universe scan — three pipeline stages:
+      Stage 1: fast batch prefilter (daily bars, liquidity/cap check)
+      Stage 2: chunked intraday download matching the scan timeframe
+               (100-ticker chunks → single HTTP call per chunk)
+      Stage 3: parallel scoring via df_override (zero per-ticker fetches)
+
+    10x faster than the sequential version because:
+      - yf.download() fetches all tickers in one HTTP call per chunk
+      - scan_symbol() uses df_override to skip its own fetch_intraday()
+      - ThreadPoolExecutor parallelizes the scoring math
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    print(f"[UNIVERSE] Start {datetime.now().strftime('%H:%M:%S')}")
+    import yfinance as yf
+
+    # Timeframe → yfinance period mapping
+    # Must match what fetch_intraday() would fetch so df_override is valid
+    _period_map = {"1m":"1d","2m":"5d","5m":"5d","15m":"60d","30m":"60d","1h":"730d"}
+    _dl_period   = _period_map.get(timeframe, "5d")
+    _dl_interval = timeframe   # match scan timeframe exactly
+
+    print(f"[UNIVERSE] Start {datetime.now().strftime('%H:%M:%S')}  "
+          f"tf={timeframe}  dl_period={_dl_period}")
+
+    # ── Stage 1: Prefilter (batched daily bars)
     survivors = universe_prefilter_fast(UNIVERSE)
-    if not survivors: return pd.DataFrame()
-    market  = get_market_regime()
+    if not survivors:
+        print("[UNIVERSE] No survivors after prefilter.")
+        return pd.DataFrame()
+
+    # ── Market regime snapshot (passed to scan_symbol)
+    market = get_market_regime()
+
+    # ── Stage 2: Chunked intraday download (timeframe-matched)
+    batched = {}
+    chunk_size = 100
+
+    chunks = [survivors[i:i + chunk_size] for i in range(0, len(survivors), chunk_size)]
+    print(f"[UNIVERSE] Downloading {len(survivors)} survivors in "
+          f"{len(chunks)} chunks (interval={_dl_interval})...")
+
+    for idx, chunk in enumerate(chunks, 1):
+        print(f"[UNIVERSE] Chunk {idx}/{len(chunks)} ({len(chunk)} tickers)")
+        try:
+            raw = yf.download(
+                tickers=" ".join(chunk),
+                period=_dl_period,
+                interval=_dl_interval,   # FIXED: was hardcoded "1m", now matches timeframe
+                group_by="ticker",
+                threads=True,
+                auto_adjust=True,
+                progress=False,
+                timeout=30,
+            )
+            if raw is None or raw.empty:
+                continue
+            is_multi = isinstance(raw.columns, pd.MultiIndex)
+            for sym in chunk:
+                try:
+                    df = raw[sym].copy() if is_multi else raw.copy()
+                    df.columns = [c.lower() if not isinstance(c, tuple) else c[0].lower()
+                                  for c in df.columns]
+                    if "close" in df.columns and len(df) >= 15:
+                        batched[sym] = df
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[UNIVERSE] Chunk {idx} download error: {e}")
+
+    print(f"[UNIVERSE] Valid price data: {len(batched)}/{len(survivors)}")
+    
+    # ── Stage 3: Parallel scoring using df_override
     results = []
 
     def _scan_one(sym):
         try:
-            return scan_symbol(sym, market, timeframe)
+            df = batched.get(sym)
+            if df is None:
+                return None
+            return scan_symbol(sym, market, timeframe, df_override=df)
         except Exception as e:
             print(f"[UNIVERSE ERR] {sym}: {e}")
             return None
 
+    print(f"[UNIVERSE] Scanning {len(batched)} symbols (parallel)...")
+
     done = 0
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(_scan_one, sym): sym for sym in survivors}
+        futures = {ex.submit(_scan_one, sym): sym for sym in batched}
         for fut in as_completed(futures):
             r = fut.result()
-            if r: results.append(r)
+            if r:
+                results.append(r)
             done += 1
             if done % 10 == 0:
-                print(f"[UNIVERSE] {done}/{len(survivors)}")
+                print(f"[UNIVERSE] {done}/{len(batched)} scanned")
 
-    if not results: return pd.DataFrame()
-    df = pd.DataFrame(results).sort_values(by=["score","bayes_prob"],
-                                            ascending=False).reset_index(drop=True)
+    if not results:
+        print("[UNIVERSE] No results after scoring.")
+        return pd.DataFrame()
+
+    # ── Sort + save top picks
+    df = pd.DataFrame(results).sort_values(
+        by=["score", "bayes_prob"], ascending=False
+    ).reset_index(drop=True)
+
+    # Write auto_watchlist.txt
     with open(os.path.join(SCANNER_DIR, "auto_watchlist.txt"), "w") as f:
         f.write("\n".join(df.head(top_n)["symbol"].tolist()))
-    print(f"[UNIVERSE] Saved top {top_n} -> auto_watchlist.txt")
-    export_excel(df, market)
-    return df
 
+    print(f"[UNIVERSE] Saved top {top_n} → auto_watchlist.txt")
+
+    # Export Excel via engine
+    export_excel(df, market)
+
+    return df
 
 # ── Russell 2000 Batched Scanner ─────────────────────────────────────────────
 # Scans the full IWM constituent list in batches of 500 to avoid rate limits.
@@ -2640,7 +3472,7 @@ def run_universe_scan(top_n: int = 30, timeframe: str = "5m") -> pd.DataFrame:
 RUSSELL2000_SYMBOLS = [
     # Technology
     "ACLS","ADTH","AEHR","AGYS","ALLT","AMSWA","AOSL","APPF","ARLO","ATEN",
-    "ATNI","AVNW","AXNX","BAND","BCOV","BLKB","BSIG","CASS","CEVA","CGNT",
+    "ATNI","AVNW","BAND","BCOV","BLKB","BSIG","CASS","CEVA","CGNT",
     "CLFD","CLPS","CMPR","CNXC","COHU","CSTL","CSWI","DOMO","DTIL","DTST",
     "EBIX","EDAC","EGAN","EGHT","ENVA","EVTC","EXPI","EXLP","FCRD","FIVN",
     "FORM","FORR","GDOT","GEOS","GLNG","GNSS","GRPN","GTLB","HCAT","HIMX",
@@ -2648,34 +3480,34 @@ RUSSELL2000_SYMBOLS = [
     "LSCC","LSTR","LYTS","MARA","MGNI","MLAB","MMSI","MODV","MODN","MORN",
     "MRCY","MTSI","NTGR","NTRA","NVAX","ONTO","POWI","PRCT","PSTG","PWSC",
     "QADA","QNST","RAMP","SCSC","SHEN","SIFY","SILK","SMTC","SPOK","SSYS",
-    "STRL","TASK","TCMD","TELOS","TTEC","TUYA","TZOO","VCRA","VIAV","VNET",
+    "STRL","TASK","TCMD","TELOS","TTEC","TUYA","TZOO","VIAV","VNET",
     # Healthcare
     "ACAD","ACET","ACLS","ACMR","ADMA","AGIO","AKCA","ALDX","ALEC","ALOG",
     "AMPH","AMRX","ARWR","ATRC","AVDL","AXDX","AXGT","BCPC","BIIB","BLFS",
     "BPMC","BTBT","CALA","CALX","CAMT","CASI","CBPO","CCRN","CDMO","CDNA",
     "CERO","CGEM","CGEN","CHRS","CLOV","CMPS","CNMD","CODX","CORT","CPRX",
     "CRVL","CSTE","CTLT","CTMX","CVAC","CYTK","DRIO","DYAI","ENTA","ESTE",
-    "EVIO","EVLO","FATE","FDMT","FGEN","FOLD","FREQ","GALT","GERN","GKOS",
+    "EVIO","EVLO","FATE","FDMT","FOLD","FREQ","GALT","GERN","GKOS",
     "GLPG","GNCA","GNFT","GOSS","GRTS","HALO","HCAT","HIMS","HROW","HRMY",
-    "HTBK","IMCR","IMGO","IMTX","IMVT","INDB","INMD","IONS","IOVA","IPHA",
+    "IMCR","IMGO","IMTX","IMVT","INDB","INMD","IONS","IOVA","IPHA",
     "KRYS","KRTX","LGND","LNTH","MGNX","MYGN","NKTR","NTRA","NUVL","NVAX",
     "OCGN","OCUL","OMCL","OPCH","OPRT","ORGO","PCRX","PDCO","PDLI","PRME",
     # Financials
-    "ABR","ACNB","AFCG","ALEX","AMAL","AMNB","AMTB","ANCX","AROW","ATLC",
+    "ABR","ACNB","AFCG","AMAL","AMNB","AMTB","ANCX","AROW","ATLC",
     "ATLO","BANC","BANF","BANR","BBCP","BCAR","BCML","BCSB","BFIN","BFST",
     "BHLB","BKNG","BKSC","BLMN","BMRC","BNCN","BOCH","BOKF","BPOP","BRKL",
     "BSVN","BUSE","BYFC","CABO","CADE","CAR","CARE","CASH","CATO","CBFV",
     "CBSH","CBTX","CCBG","CCNE","CFFN","CFFI","CFNB","CHCO","CHMG","CIVB",
     "CLBK","CLDB","CMTV","CNOB","COOP","CORE","CRAI","CRBP","CSTR","CTBI",
-    "CUBI","CURE","CURO","CVBF","CVCY","CZWI","DCOM","DENN","DFIN","DGICA",
-    "EBMT","ECPG","EFSC","EFC","ENVA","ESSA","EVBN","EVTC","FBIZ","FBMS",
+    "CUBI","CURE","CVBF","CVCY","CZWI","DCOM","DENN","DFIN","DGICA",
+    "EBMT","ECPG","EFSC","EFC","ENVA","ESSA","EVBN","EVTC","FBIZ",
     # Industrials / Energy / Materials
     "ASTE","ASTL","ATRI","AVAV","AVNT","AZTA","BATL","BCPC","BWXT","CIVI",
-    "CLW","CMCO","CNSL","CRS","CSWI","CWST","DAN","DXPE","ECCA","ENVA",
+    "CLW","CMCO","CRS","CSWI","CWST","DAN","DXPE","ECCA","ENVA",
     "EPAC","ERII","FBHS","FELE","FSTR","GATX","GFF","GHM","GLDD","GNRC",
     "GTLS","HAYW","HLIO","HURC","HWKN","HYMC","IESC","ITRI","JBSS",
-    "KELYA","KTOS","KWR","LBAI","LCII","LCUT","LECO","LYTS","MATW","MATX",
-    "MBIN","MCBC","MCRI","MDRX","MERC","MGPI","MNRO","MRTN","MRUS","MSEX",
+    "KELYA","KTOS","KWR","LCII","LCUT","LECO","LYTS","MATW","MATX",
+    "MBIN","MCBC","MCRI","MERC","MGPI","MNRO","MRTN","MRUS","MSEX",
     "MTDR","NNBR","NOMD","NOVT","NSP","OBNK","OSIS","PTEN","REX","RYAM",
     "SCVL","SHYF","SPXC","STAG","STRL","SUNL","SUPN","SVRA","SWBI","TCBK",
     "TROX","TRST","TTGT","TUEM","UFCS","UFPT","UITB","ULCC","UONE","USAC",
@@ -2779,7 +3611,7 @@ def run_russell2000_scan(timeframe: str = "5m", top_n: int = 30) -> tuple:
             df_d = fetch_daily(sym, 60)
             if df_d is None or len(df_d) < 30:
                 return sym, None, "NO_DATA", "Insufficient bars"
-            liq_ok, liq_msg = passes_liquidity_firewall(df_d, sym, STRATEGY_MODE)
+            liq_ok, liq_msg, _ = passes_liquidity_firewall(df_d, sym, STRATEGY_MODE)
             if not liq_ok:
                 return sym, None, "LIQUIDITY", liq_msg
             r = scan_symbol(sym, market, timeframe)
@@ -3427,7 +4259,7 @@ def run_dashboard():
             ("Sector",    sec_bull,                                   etf_name),
             ("ADD",       bool(top.get("add_bull",True)),             f"{top.get('add_val',0):.3f}"),
             ("Z-Score",   bool(top.get("zscore_ok",True)),            f"Z={z_val:.2f}"),
-            ("R:R >= 2",   bool(top.get("rr_ok",False)),              f"{top.get('rr_ratio',0):.1f}:1"),
+            ("R:R >= 3",   bool(top.get("rr_ok",False)),              f"{top.get('rr_ratio',0):.1f}:1"),
             ("VWAP",      above_vwap,                                 f"${top.get('vwap',0):.2f}"),
             ("Half-Life", bool(top.get("hl_alive",True)),             f"{hl_rem}s"),
         ]
